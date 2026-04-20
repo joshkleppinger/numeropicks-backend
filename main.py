@@ -221,3 +221,232 @@ def startup():
         rows = load_draws(GAMES[key])
         _draw_cache[key] = rows
         print(f"[startup] {key}: {len(rows):,} draws loaded")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPREADSHEET DOWNLOADS
+# ══════════════════════════════════════════════════════════════════════════════
+
+from fastapi.responses import StreamingResponse, HTMLResponse
+import csv as csv_module
+import io
+
+
+@app.get("/download/{game_key}/csv")
+def download_csv(game_key: str):
+    """Download all historical draws for a game as a CSV file."""
+    if game_key not in GAMES:
+        raise HTTPException(status_code=404, detail=f"Unknown game: {game_key}")
+
+    game = GAMES[game_key]
+    rows = _get_draws(game_key)
+    if not rows:
+        raise HTTPException(status_code=404,
+                            detail="No data yet. Run a scrape first.")
+
+    n          = game["white_count"]
+    sn         = game["special_name"]
+    fieldnames = ["date"] + [f"ball_{i}" for i in range(1, n + 1)] + [sn.lower()]
+
+    buf = io.StringIO()
+    writer = csv_module.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        row = {"date": r["date"], sn.lower(): r["special"]}
+        for i, b in enumerate(r["balls"], 1):
+            row[f"ball_{i}"] = b
+        writer.writerow(row)
+
+    buf.seek(0)
+    filename = f"{game['display_name'].replace(' ', '_')}_draws.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/download/{game_key}/xlsx")
+def download_xlsx(game_key: str):
+    """Download all historical draws for a game as an Excel (.xlsx) file."""
+    if game_key not in GAMES:
+        raise HTTPException(status_code=404, detail=f"Unknown game: {game_key}")
+
+    try:
+        import openpyxl
+        from openpyxl.styles import (Font, PatternFill, Alignment,
+                                     Border, Side)
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="openpyxl not installed. Add it to requirements.txt."
+        )
+
+    game = GAMES[game_key]
+    rows = _get_draws(game_key)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No data yet.")
+
+    n   = game["white_count"]
+    sn  = game["special_name"]
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = game["display_name"]
+
+    # ── Styling ───────────────────────────────────────────────────────────────
+    header_fill   = PatternFill("solid", fgColor="1E293B")   # dark slate
+    header_font   = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+    special_fill  = PatternFill("solid", fgColor="EF4444")   # red
+    special_font  = Font(bold=True, color="FFFFFF", name="Calibri")
+    alt_fill      = PatternFill("solid", fgColor="F1F5F9")   # light grey
+    center        = Alignment(horizontal="center")
+    thin_border   = Border(
+        left=Side(style="thin", color="CBD5E1"),
+        right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"),
+        bottom=Side(style="thin", color="CBD5E1"),
+    )
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    headers = ["Date"] + [f"Ball {i}" for i in range(1, n + 1)] + [sn]
+    for col, hdr in enumerate(headers, 1):
+        cell           = ws.cell(row=1, column=col, value=hdr)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = center
+        cell.border    = thin_border
+
+    # ── Data rows (newest first) ───────────────────────────────────────────────
+    for row_idx, r in enumerate(reversed(rows), 2):
+        fill = alt_fill if row_idx % 2 == 0 else None
+        # Date
+        c           = ws.cell(row=row_idx, column=1, value=r["date"])
+        c.border    = thin_border
+        if fill: c.fill = fill
+
+        # White balls
+        for col, b in enumerate(r["balls"], 2):
+            c           = ws.cell(row=row_idx, column=col, value=b)
+            c.alignment = center
+            c.border    = thin_border
+            if fill: c.fill = fill
+
+        # Special ball (red)
+        c           = ws.cell(row=row_idx, column=n + 2, value=r["special"])
+        c.font      = special_font
+        c.fill      = special_fill
+        c.alignment = center
+        c.border    = thin_border
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 22
+    for col in range(2, n + 3):
+        ws.column_dimensions[
+            openpyxl.utils.get_column_letter(col)
+        ].width = 9
+
+    # ── Freeze header row ─────────────────────────────────────────────────────
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"{game['display_name'].replace(' ', '_')}_draws.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/downloads", response_class=HTMLResponse)
+def downloads_page():
+    """A styled HTML page with download buttons for all games."""
+    game_blocks = ""
+    for key, game in GAMES.items():
+        rows      = _get_draws(key)
+        row_count = f"{len(rows):,}"
+        latest    = rows[-1]["date"] if rows else "No data yet"
+        sn        = game["special_name"]
+        game_blocks += f"""
+        <div class="game-card">
+          <h2>{game['display_name']}</h2>
+          <p class="meta">
+            <strong>{row_count}</strong> draws &nbsp;·&nbsp;
+            Latest: <strong>{latest}</strong> &nbsp;·&nbsp;
+            Special ball: <strong>{sn}</strong>
+          </p>
+          <div class="btn-row">
+            <a href="/download/{key}/csv"  class="btn btn-csv">
+              ⬇ Download CSV
+            </a>
+            <a href="/download/{key}/xlsx" class="btn btn-xlsx">
+              ⬇ Download Excel (.xlsx)
+            </a>
+          </div>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>NumeroPicks — Download Historical Data</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0a0e1a; color: #e2e8f0; min-height: 100vh; padding: 2rem;
+    }}
+    header {{
+      text-align: center; margin-bottom: 2.5rem;
+    }}
+    header h1 {{
+      font-size: 2.4rem; font-weight: 900;
+      color: #ef4444; letter-spacing: 0.08em; font-family: "Courier New", monospace;
+    }}
+    header p {{ color: #94a3b8; margin-top: 0.4rem; font-size: 1rem; }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5rem; max-width: 1000px; margin: 0 auto;
+    }}
+    .game-card {{
+      background: #111827; border-radius: 1rem; padding: 1.6rem;
+      border: 1px solid #1e293b;
+    }}
+    .game-card h2 {{
+      font-size: 1.3rem; font-weight: 700; margin-bottom: 0.5rem;
+      color: #f1f5f9;
+    }}
+    .meta {{ color: #94a3b8; font-size: 0.88rem; margin-bottom: 1.2rem; }}
+    .btn-row {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
+    .btn {{
+      display: inline-block; padding: 0.6rem 1.2rem;
+      border-radius: 999px; font-weight: 600; font-size: 0.9rem;
+      text-decoration: none; transition: opacity .15s;
+    }}
+    .btn:hover {{ opacity: 0.85; }}
+    .btn-csv  {{ background: #1e40af; color: #fff; }}
+    .btn-xlsx {{ background: #166534; color: #fff; }}
+    footer {{
+      text-align: center; margin-top: 3rem;
+      color: #475569; font-size: 0.82rem;
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🎱 NUMEROPICKS</h1>
+    <p>Download complete historical draw data for all supported games</p>
+  </header>
+  <div class="grid">
+    {game_blocks}
+  </div>
+  <footer>
+    <p>Data sourced from lottery.net &nbsp;·&nbsp; numeropicks.com</p>
+  </footer>
+</body>
+</html>"""
