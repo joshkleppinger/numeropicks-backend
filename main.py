@@ -450,3 +450,19 @@ def downloads_page():
   </footer>
 </body>
 </html>"""
+
+
+# ── Logo endpoint — serves red_ball_logo.png from the data directory ──────────
+from fastapi.responses import FileResponse
+import mimetypes
+
+@app.get("/logo")
+def serve_logo():
+    """Serve red_ball_logo.png from the Numero data folder."""
+    for fname in ["red_ball_logo.png", "red_ball_logo.jpg"]:
+        path = DATA_DIR / fname
+        if path.exists():
+            mt = mimetypes.guess_type(str(path))[0] or "image/png"
+            return FileResponse(str(path), media_type=mt)
+    # Return 404 — frontend will fall back to the inline SVG ball
+    raise HTTPException(status_code=404, detail="Logo not found")
