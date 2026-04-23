@@ -216,11 +216,43 @@ def get_next_draw(game_key: str):
 
 @app.on_event("startup")
 def startup():
-    """Pre-load all draw histories into cache on startup."""
+    """Pre-load all draw histories into cache, then auto-scrape any missing data."""
     for key in GAMES:
         rows = load_draws(GAMES[key])
         _draw_cache[key] = rows
         print(f"[startup] {key}: {len(rows):,} draws loaded")
+
+    # Auto-scrape in background if any game has no data or stale data (>3 days)
+    def _auto_scrape():
+        import time
+        time.sleep(2)  # Let the server finish starting up first
+        needs_scrape = []
+        ls = load_scrape_state()
+        for key in GAMES:
+            rows = _draw_cache.get(key, [])
+            if len(rows) < 10:
+                needs_scrape.append(key)
+                print(f"[auto-scrape] {key}: no data, queuing scrape")
+        if not needs_scrape:
+            from datetime import datetime
+            if ls is None or (datetime.now() - ls).days >= 3:
+                needs_scrape = list(GAMES.keys())
+                print(f"[auto-scrape] data stale or never scraped, scraping all")
+        if needs_scrape:
+            print(f"[auto-scrape] starting scrape for: {needs_scrape}")
+            for key in needs_scrape:
+                try:
+                    rows = _draw_cache.get(key, [])
+                    added, msg = scrape_game(GAMES[key], rows)
+                    _draw_cache[key] = rows
+                    print(f"[auto-scrape] {key}: {msg}")
+                except Exception as e:
+                    print(f"[auto-scrape] {key} error: {e}")
+        else:
+            print(f"[auto-scrape] all data fresh, skipping")
+
+    import threading
+    threading.Thread(target=_auto_scrape, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
