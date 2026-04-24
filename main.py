@@ -34,6 +34,7 @@ _analyze_lock = threading.Lock()
 
 # ── Progress tracking for long-running analysis ───────────────────────────────
 _analysis_progress: dict[str, dict] = {}
+_job_results: dict[str, dict] = {}   # job_id -> result or error
 
 
 def _get_draws(game_key: str) -> list:
@@ -192,6 +193,49 @@ def accuracy(game_key: str):
         "evaluated": evaluated[-10:],    # last 10 rounds
         "pending":   pending,
     }
+
+
+@app.post("/predict-async/{game_key}")
+def predict_async(game_key: str, background_tasks: BackgroundTasks):
+    """Start a prediction job in the background. Returns a job_id to poll."""
+    import uuid
+    if game_key not in GAMES:
+        raise HTTPException(status_code=404, detail=f"Unknown game: {game_key}")
+    rows = _get_draws(game_key)
+    if not rows:
+        raise HTTPException(status_code=400,
+            detail=f"No draw history for {game_key}. Scrape first.")
+    job_id = str(uuid.uuid4())[:8]
+    _job_results[job_id] = {"status": "running"}
+
+    def _run():
+        try:
+            game    = GAMES[game_key]
+            tickets = analyze_and_predict(rows, game)
+            nd      = next_draw_date(game)
+            if tickets:
+                save_predictions(game, tickets, nd)
+            _job_results[job_id] = {
+                "status":       "done",
+                "game":         game_key,
+                "next_draw":    nd,
+                "tickets":      tickets,
+                "special_name": game["special_name"],
+            }
+        except Exception as e:
+            _job_results[job_id] = {"status": "error", "detail": str(e)}
+
+    background_tasks.add_task(_run)
+    return {"job_id": job_id, "status": "running"}
+
+
+@app.get("/predict-result/{job_id}")
+def predict_result(job_id: str):
+    """Poll for the result of a predict-async job."""
+    result = _job_results.get(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return result
 
 
 @app.get("/next-draw/{game_key}")
