@@ -22,8 +22,8 @@ app = FastAPI(title="NumeroPicks API", version="1.0.0")
 # ── CORS: allow the React frontend (any origin in dev, locked down in prod) ───
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten to ["https://numeropicks.com"] in prod
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,      # must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
