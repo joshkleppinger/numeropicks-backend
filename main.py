@@ -130,17 +130,25 @@ def scrape_status():
 def predict(game_key: str, save: bool = True):
     """
     Run the full 7-method analysis and return 5 predicted tickets.
-    Pass ?save=false to skip writing to the predictions CSV.
-    This is synchronous — analysis can take 10-30s.
+    Waits up to 90s for auto-scrape to populate data if needed.
     """
     if game_key not in GAMES:
         raise HTTPException(status_code=404, detail=f"Unknown game: {game_key}")
+
+    import time as _time
+    # Wait up to 90 seconds for auto-scrape to finish if no data yet
+    for _ in range(18):
+        rows = _get_draws(game_key)
+        if rows:
+            break
+        print(f"[predict] waiting for scrape data for {game_key}...")
+        _time.sleep(5)
 
     game = GAMES[game_key]
     rows = _get_draws(game_key)
     if not rows:
         raise HTTPException(status_code=400,
-                            detail=f"No draw history for {game_key}. Run /scrape/{game_key} first.")
+                            detail=f"No draw history for {game_key}. Scrape still running — try again in 2 minutes.")
 
     with _analyze_lock:
         tickets = analyze_and_predict(rows, game)
@@ -266,37 +274,29 @@ def startup():
         _draw_cache[key] = rows
         print(f"[startup] {key}: {len(rows):,} draws loaded")
 
-    # Auto-scrape in background if any game has no data or stale data (>3 days)
+    # Auto-scrape synchronously if missing data — predict won't work without it
     def _auto_scrape():
         import time
-        time.sleep(2)  # Let the server finish starting up first
-        needs_scrape = []
-        ls = load_scrape_state()
+        time.sleep(1)
+        total_rows = sum(len(_draw_cache.get(k, [])) for k in GAMES)
+        if total_rows >= 30:
+            print(f"[auto-scrape] {total_rows} rows found, skipping scrape")
+            return
+        print(f"[auto-scrape] No data found ({total_rows} rows) — scraping all games now...")
         for key in GAMES:
-            rows = _draw_cache.get(key, [])
-            if len(rows) < 10:
-                needs_scrape.append(key)
-                print(f"[auto-scrape] {key}: no data, queuing scrape")
-        if not needs_scrape:
-            from datetime import datetime
-            if ls is None or (datetime.now() - ls).days >= 3:
-                needs_scrape = list(GAMES.keys())
-                print(f"[auto-scrape] data stale or never scraped, scraping all")
-        if needs_scrape:
-            print(f"[auto-scrape] starting scrape for: {needs_scrape}")
-            for key in needs_scrape:
-                try:
-                    rows = _draw_cache.get(key, [])
-                    added, msg = scrape_game(GAMES[key], rows)
-                    _draw_cache[key] = rows
-                    print(f"[auto-scrape] {key}: {msg}")
-                except Exception as e:
-                    print(f"[auto-scrape] {key} error: {e}")
-        else:
-            print(f"[auto-scrape] all data fresh, skipping")
+            try:
+                rows = _draw_cache.get(key, [])
+                print(f"[auto-scrape] Starting {key}...")
+                added, msg = scrape_game(GAMES[key], rows)
+                _draw_cache[key] = rows
+                print(f"[auto-scrape] {key}: {msg}")
+            except Exception as e:
+                print(f"[auto-scrape] {key} ERROR: {e}")
+        total = sum(len(_draw_cache.get(k, [])) for k in GAMES)
+        print(f"[auto-scrape] Complete. Total rows: {total}")
 
     import threading
-    threading.Thread(target=_auto_scrape, daemon=True).start()
+    threading.Thread(target=_auto_scrape, daemon=False).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
