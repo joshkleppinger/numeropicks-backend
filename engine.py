@@ -30,7 +30,7 @@ try:
 except ImportError:                 HAS_REQUESTS = False
 
 # ── Data directory ─────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("NUMERO_DATA_DIR", "/opt/render/project/src/data"))
+DATA_DIR = Path(os.environ.get("NUMERO_DATA_DIR", "/data/numero"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SCRAPE_STATE = DATA_DIR / "scrape_state.json"
 
