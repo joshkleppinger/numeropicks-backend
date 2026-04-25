@@ -135,20 +135,11 @@ def predict(game_key: str, save: bool = True):
     if game_key not in GAMES:
         raise HTTPException(status_code=404, detail=f"Unknown game: {game_key}")
 
-    import time as _time
-    # Wait up to 90 seconds for auto-scrape to finish if no data yet
-    for _ in range(18):
-        rows = _get_draws(game_key)
-        if rows:
-            break
-        print(f"[predict] waiting for scrape data for {game_key}...")
-        _time.sleep(5)
-
     game = GAMES[game_key]
     rows = _get_draws(game_key)
     if not rows:
         raise HTTPException(status_code=400,
-                            detail=f"No draw history for {game_key}. Scrape still running — try again in 2 minutes.")
+                            detail=f"No draw history for {game_key}. Run /scrape-all first.")
 
     with _analyze_lock:
         tickets = analyze_and_predict(rows, game)
@@ -268,35 +259,58 @@ def get_next_draw(game_key: str):
 
 @app.on_event("startup")
 def startup():
-    """Pre-load all draw histories into cache, then auto-scrape any missing data."""
+    """
+    Load draw histories from persistent disk into cache.
+    On paid Render tier, data persists between restarts so we rarely need to scrape.
+    Only auto-scrapes if data is completely missing.
+    """
+    total = 0
     for key in GAMES:
         rows = load_draws(GAMES[key])
         _draw_cache[key] = rows
+        total += len(rows)
         print(f"[startup] {key}: {len(rows):,} draws loaded")
 
-    # Auto-scrape synchronously if missing data — predict won't work without it
-    def _auto_scrape():
-        import time
-        time.sleep(1)
-        total_rows = sum(len(_draw_cache.get(k, [])) for k in GAMES)
-        if total_rows >= 30:
-            print(f"[auto-scrape] {total_rows} rows found, skipping scrape")
-            return
-        print(f"[auto-scrape] No data found ({total_rows} rows) — scraping all games now...")
-        for key in GAMES:
-            try:
-                rows = _draw_cache.get(key, [])
-                print(f"[auto-scrape] Starting {key}...")
-                added, msg = scrape_game(GAMES[key], rows)
-                _draw_cache[key] = rows
-                print(f"[auto-scrape] {key}: {msg}")
-            except Exception as e:
-                print(f"[auto-scrape] {key} ERROR: {e}")
-        total = sum(len(_draw_cache.get(k, [])) for k in GAMES)
-        print(f"[auto-scrape] Complete. Total rows: {total}")
+    print(f"[startup] Total: {total:,} draws across all games")
 
-    import threading
-    threading.Thread(target=_auto_scrape, daemon=False).start()
+    if total < 30:
+        # First run ever — scrape everything in background
+        print("[startup] No data found — running initial scrape in background...")
+        def _initial_scrape():
+            import time
+            time.sleep(2)
+            for key in GAMES:
+                try:
+                    rows = _draw_cache.get(key, [])
+                    added, msg = scrape_game(GAMES[key], rows)
+                    _draw_cache[key] = rows
+                    print(f"[initial-scrape] {key}: {msg}")
+                except Exception as e:
+                    print(f"[initial-scrape] {key} ERROR: {e}")
+        import threading
+        threading.Thread(target=_initial_scrape, daemon=False).start()
+    else:
+        # Data exists — check if it's stale (>3 days) and update in background
+        def _refresh_check():
+            import time
+            time.sleep(5)
+            ls = load_scrape_state()
+            from datetime import datetime
+            if ls is None or (datetime.now() - ls).days >= 3:
+                print("[startup] Data stale — refreshing in background...")
+                for key in GAMES:
+                    try:
+                        rows = _draw_cache.get(key, [])
+                        added, msg = scrape_game(GAMES[key], rows)
+                        _draw_cache[key] = rows
+                        if added:
+                            print(f"[refresh] {key}: {msg}")
+                    except Exception as e:
+                        print(f"[refresh] {key} ERROR: {e}")
+            else:
+                print(f"[startup] Data fresh (last scraped: {ls.strftime('%Y-%m-%d')}), skipping refresh")
+        import threading
+        threading.Thread(target=_refresh_check, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
