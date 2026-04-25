@@ -7,6 +7,7 @@ import threading
 from datetime import datetime
 from typing import Optional
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,7 +18,37 @@ from engine import (
     compute_accuracy, next_draw_date,
 )
 
-app = FastAPI(title="NumeroPicks API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup: pre-load draw histories and auto-scrape if needed."""
+    for key in GAMES:
+        rows = load_draws(GAMES[key])
+        _draw_cache[key] = rows
+        print(f"[startup] {key}: {len(rows):,} draws loaded")
+
+    def _auto_scrape():
+        import time
+        time.sleep(1)
+        total_rows = sum(len(_draw_cache.get(k, [])) for k in GAMES)
+        if total_rows >= 30:
+            print(f"[auto-scrape] {total_rows} rows found, skipping")
+            return
+        print(f"[auto-scrape] No data ({total_rows} rows) — scraping all games...")
+        for key in GAMES:
+            try:
+                rows = _draw_cache.get(key, [])
+                added, msg = scrape_game(GAMES[key], rows)
+                _draw_cache[key] = rows
+                print(f"[auto-scrape] {key}: {msg}")
+            except Exception as e:
+                print(f"[auto-scrape] {key} ERROR: {e}")
+        print(f"[auto-scrape] Done. Total: {sum(len(_draw_cache.get(k,[])) for k in GAMES)}")
+
+    import threading
+    threading.Thread(target=_auto_scrape, daemon=False).start()
+    yield  # app runs here
+
+app = FastAPI(title="NumeroPicks API", version="1.0.0", lifespan=lifespan)
 
 # ── CORS: allow the React frontend (any origin in dev, locked down in prod) ───
 app.add_middleware(
