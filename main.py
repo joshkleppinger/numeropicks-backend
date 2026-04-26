@@ -180,11 +180,20 @@ def predict(game_key: str, save: bool = True):
     if save and tickets:
         save_predictions(game, tickets, nd)
 
+    # Convert numpy integers to plain Python ints for JSON serialization
+    clean_tickets = [
+        {
+            "balls":   [int(b) for b in t["balls"]],
+            "special": int(t["special"]),
+        }
+        for t in tickets
+    ]
+
     return {
-        "game":           game_key,
-        "next_draw":      nd,
-        "tickets":        tickets,
-        "special_name":   game["special_name"],
+        "game":         game_key,
+        "next_draw":    nd,
+        "tickets":      clean_tickets,
+        "special_name": game["special_name"],
     }
 
 
