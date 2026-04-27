@@ -12,6 +12,11 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from database import (
+    init_db, save_prediction_db, load_predictions_db,
+    save_scrape_state_db, load_scrape_state_db,
+    save_draws_db, load_draws_db,
+)
 from engine import (
     GAMES, load_draws, save_draws, scrape_game, load_scrape_state,
     analyze_and_predict, save_predictions, compare_predictions,
@@ -20,32 +25,60 @@ from engine import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: pre-load draw histories and auto-scrape if needed."""
-    for key in GAMES:
-        rows = load_draws(GAMES[key])
-        _draw_cache[key] = rows
-        print(f"[startup] {key}: {len(rows):,} draws loaded")
+    """Startup: init DB, load draws, auto-scrape if needed, schedule 12h refresh."""
+    # Init Supabase tables
+    init_db()
 
-    def _auto_scrape():
+    # Load draw history — try DB first, fall back to CSV
+    for key in GAMES:
+        db_rows = load_draws_db(key)
+        if db_rows:
+            _draw_cache[key] = db_rows
+            print(f"[startup] {key}: {len(db_rows):,} draws loaded from DB")
+        else:
+            csv_rows = load_draws(GAMES[key])
+            _draw_cache[key] = csv_rows
+            print(f"[startup] {key}: {len(csv_rows):,} draws loaded from CSV")
+
+    def _run_scrape(force=False):
+        """Scrape all games and persist to DB + CSV."""
         import time
-        time.sleep(1)
-        total_rows = sum(len(_draw_cache.get(k, [])) for k in GAMES)
-        if total_rows >= 30:
-            print(f"[auto-scrape] {total_rows} rows found, skipping")
+        if not force:
+            time.sleep(1)
+        total = sum(len(_draw_cache.get(k, [])) for k in GAMES)
+        # Check last scrape time from DB
+        ls = load_scrape_state_db() or load_scrape_state()
+        needs_scrape = (total < 30) or force
+        if not needs_scrape and ls:
+            hours_ago = (datetime.now() - ls).total_seconds() / 3600
+            needs_scrape = hours_ago >= 12
+        if not needs_scrape:
+            print(f"[auto-scrape] {total} rows, data fresh — skipping")
             return
-        print(f"[auto-scrape] No data ({total_rows} rows) — scraping all games...")
+        print(f"[auto-scrape] Scraping all games (total={total}, force={force})...")
         for key in GAMES:
             try:
                 rows = _draw_cache.get(key, [])
                 added, msg = scrape_game(GAMES[key], rows)
                 _draw_cache[key] = rows
-                print(f"[auto-scrape] {key}: {msg}")
+                # Persist to DB
+                db_added = save_draws_db(key, rows)
+                print(f"[auto-scrape] {key}: {msg} (+{db_added} to DB)")
             except Exception as e:
                 print(f"[auto-scrape] {key} ERROR: {e}")
+        save_scrape_state_db()
         print(f"[auto-scrape] Done. Total: {sum(len(_draw_cache.get(k,[])) for k in GAMES)}")
 
+    def _scheduler():
+        """Run a scrape every 12 hours."""
+        import time
+        _run_scrape(force=False)
+        while True:
+            time.sleep(12 * 3600)
+            _run_scrape(force=True)
+
     import threading
-    threading.Thread(target=_auto_scrape, daemon=False).start()
+    threading.Thread(target=_scheduler, daemon=False).start()
     yield  # app runs here
 
 app = FastAPI(title="NumeroPicks API", version="1.0.0", lifespan=lifespan)
@@ -146,14 +179,16 @@ def scrape_all(background_tasks: BackgroundTasks):
 @app.get("/scrape-status")
 def scrape_status():
     """Return the last scrape timestamp and staleness flag."""
-    ls = load_scrape_state()
+    ls = load_scrape_state_db() or load_scrape_state()
     if ls is None:
         return {"last_scrape": None, "stale": True, "days_ago": None}
-    days_ago = (datetime.now() - ls).days
+    hours_ago = (datetime.now() - ls).total_seconds() / 3600
+    days_ago  = int(hours_ago / 24)
     return {
         "last_scrape": ls.isoformat(),
+        "hours_ago":   round(hours_ago, 1),
         "days_ago":    days_ago,
-        "stale":       days_ago >= 3,
+        "stale":       hours_ago >= 12,
     }
 
 
@@ -179,6 +214,10 @@ def predict(game_key: str, save: bool = True):
 
     if save and tickets:
         save_predictions(game, tickets, nd)
+        # Also persist to Supabase so predictions survive restarts
+        today = datetime.now().strftime("%Y-%m-%d")
+        for t in clean_tickets:
+            save_prediction_db(game_key, t["balls"], t["special"], today, nd)
 
     # Convert numpy integers to plain Python ints for JSON serialization
     clean_tickets = [
@@ -205,7 +244,9 @@ def accuracy(game_key: str):
 
     game = GAMES[game_key]
     rows = _get_draws(game_key)
-    data = compare_predictions(game, rows)
+    # Load predictions from DB (persistent) + CSV fallback
+    db_preds = load_predictions_db(game_key)
+    data = compare_predictions_with_db(game, rows, db_preds) if db_preds else compare_predictions(game, rows)
 
     evaluated = data["evaluated"]
     pending   = data["pending"]
