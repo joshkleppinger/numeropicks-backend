@@ -724,3 +724,62 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
     evaluated.sort(key=lambda r: parse_date(r["target_draw_date"]) or datetime.min)
     pending.sort(key=lambda r:   parse_date(r["target_draw_date"]) or datetime.min)
     return {"evaluated": evaluated, "pending": pending}
+
+def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> dict:
+    """Like compare_predictions but uses DB predictions list directly."""
+    from collections import defaultdict
+    n = game["white_count"]
+    draw_by_date = {}
+    for r in draw_rows:
+        dt = parse_date(r["date"])
+        if dt: draw_by_date[dt.date()] = r
+
+    from datetime import datetime as _dt
+    today = _dt.now().date()
+    rounds = defaultdict(list)
+    for p in db_preds:
+        try:
+            pred_date = str(p["prediction_date"])
+            tgt_date  = str(p["target_draw_date"])
+            rounds[(pred_date, tgt_date)].append({
+                "pred_balls":   p["pred_balls"],
+                "pred_special": p["pred_special"],
+            })
+        except Exception:
+            pass
+
+    evaluated, pending = [], []
+    for (pred_date, target_date), tickets in rounds.items():
+        tdt = parse_date(target_date)
+        if not tdt: continue
+        if tdt.date() > today:
+            pending.append({"prediction_date": pred_date,
+                            "target_draw_date": target_date,
+                            "tickets": tickets})
+            continue
+        actual = draw_by_date.get(tdt.date())
+        if actual is None:
+            pending.append({"prediction_date": pred_date,
+                            "target_draw_date": target_date,
+                            "tickets": tickets, "awaiting_scrape": True})
+            continue
+        best  = max(tickets, key=lambda t: compute_accuracy(
+            t["pred_balls"], t["pred_special"],
+            actual["balls"], actual["special"]))
+        score = compute_accuracy(best["pred_balls"], best["pred_special"],
+                                  actual["balls"], actual["special"])
+        evaluated.append({
+            "prediction_date":  pred_date,
+            "target_draw_date": target_date,
+            "pred_balls":       best["pred_balls"],
+            "pred_special":     best["pred_special"],
+            "actual_balls":     actual["balls"],
+            "actual_special":   actual["special"],
+            "white_matches":    len(set(best["pred_balls"]) & set(actual["balls"])),
+            "sp_match":         int(best["pred_special"] == actual["special"]),
+            "score":            score,
+        })
+
+    evaluated.sort(key=lambda r: parse_date(r["target_draw_date"]) or datetime.min)
+    pending.sort(key=lambda r:   parse_date(r["target_draw_date"]) or datetime.min)
+    return {"evaluated": evaluated, "pending": pending}
