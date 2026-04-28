@@ -212,13 +212,6 @@ def predict(game_key: str, save: bool = True):
 
     nd = next_draw_date(game)
 
-    if save and tickets:
-        save_predictions(game, tickets, nd)
-        # Also persist to Supabase so predictions survive restarts
-        today = datetime.now().strftime("%Y-%m-%d")
-        for t in clean_tickets:
-            save_prediction_db(game_key, t["balls"], t["special"], today, nd)
-
     # Convert numpy integers to plain Python ints for JSON serialization
     clean_tickets = [
         {
@@ -227,6 +220,13 @@ def predict(game_key: str, save: bool = True):
         }
         for t in tickets
     ]
+
+    if save and tickets:
+        save_predictions(game, tickets, nd)
+        # Also persist to Supabase so predictions survive restarts
+        today = datetime.now().strftime("%Y-%m-%d")
+        for t in clean_tickets:
+            save_prediction_db(game_key, t["balls"], t["special"], today, nd)
 
     return {
         "game":         game_key,
