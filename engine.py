@@ -58,7 +58,7 @@ GAMES = {
         "key":           "megamillions",
         "display_name":  "Mega Millions",
         "white_max":     70,
-        "special_max":   25,
+        "special_max":   24,
         "white_count":   5,
         "special_name":  "MB",
         "draw_days":     {1, 4},
@@ -617,8 +617,14 @@ def _sklearn_predict(era3_balls, era3_special, N, WHITE_MAX, SPECIAL_MAX):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def next_draw_date(game: dict) -> str:
-    today     = datetime.now().date()
+    now       = datetime.now()
+    today     = now.date()
     draw_days = game["draw_days"]
+    # If today is a draw day and it's before 11 PM (draws are ~11 PM ET),
+    # use today's drawing
+    if today.weekday() in draw_days and now.hour < 23:
+        return datetime(today.year, today.month, today.day).strftime("%a, %b %d, %Y")
+    # Otherwise find the next draw day
     for offset in range(1, 8):
         d = today + timedelta(days=offset)
         if d.weekday() in draw_days:
