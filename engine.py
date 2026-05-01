@@ -13,6 +13,33 @@ import random
 from collections import Counter
 
 # ─────────────────────────────────────────────
+# GAME DEFINITIONS (REQUIRED FOR API)
+# ─────────────────────────────────────────────
+
+GAMES = {
+    "powerball": {
+        "name": "Powerball",
+        "white_max": 69,
+        "white_count": 5,
+        "special_max": 26,
+        "special_count": 1
+    },
+    "mega_millions": {
+        "name": "Mega Millions",
+        "white_max": 70,
+        "white_count": 5,
+        "special_max": 25,
+        "special_count": 1
+    },
+    "superlotto": {
+        "name": "SuperLotto Plus",
+        "white_max": 47,
+        "white_count": 5,
+        "special_max": 27,
+        "special_count": 1
+    }
+
+# ─────────────────────────────────────────────
 # UTILITIES
 # ─────────────────────────────────────────────
 
