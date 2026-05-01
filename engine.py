@@ -1,9 +1,10 @@
 import math
 import random
+import csv
 from collections import Counter
 
 # ─────────────────────────────────────────────
-# GAME DEFINITIONS (REQUIRED)
+# GAME DEFINITIONS
 # ─────────────────────────────────────────────
 
 GAMES = {
@@ -29,6 +30,36 @@ GAMES = {
         "special_count": 1
     }
 }
+
+# ─────────────────────────────────────────────
+# DATA LOADING (FIXES YOUR ERROR)
+# ─────────────────────────────────────────────
+
+def load_draws(filepath):
+    """
+    Expects CSV with columns like:
+    date, n1, n2, n3, n4, n5, special (optional)
+
+    Returns:
+    [
+        {"balls": [1,2,3,4,5]},
+        ...
+    ]
+    """
+    rows = []
+
+    with open(filepath, "r") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+
+        for row in reader:
+            try:
+                nums = list(map(int, row[1:6]))
+                rows.append({"balls": nums})
+            except:
+                continue
+
+    return rows
 
 # ─────────────────────────────────────────────
 # UTILITIES
@@ -97,13 +128,11 @@ def analyze_and_predict(rows, game):
     m2 = gap_analysis(rows, number_range)
     m3 = decay_model(rows, number_range)
 
-    # Blend
     blended = {
         n: 0.4 * m1[n] + 0.3 * m2[n] + 0.3 * m3[n]
         for n in number_range
     }
 
-    # Monte Carlo smoothing
     probs = monte_carlo_smoothing(blended, number_range)
 
     return probs
@@ -140,7 +169,7 @@ def calibration_error(probs, rows, number_range, bins=10):
     return error / (count + 1e-12)
 
 # ─────────────────────────────────────────────
-# STATISTICAL TESTS
+# STAT TESTS
 # ─────────────────────────────────────────────
 
 def paired_t_test(a, b):
