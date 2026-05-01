@@ -1,6 +1,7 @@
 import math
 import random
 import csv
+import os
 from collections import Counter
 
 # ─────────────────────────────────────────────
@@ -32,25 +33,21 @@ GAMES = {
 }
 
 # ─────────────────────────────────────────────
-# DATA LOADING (FIXES YOUR ERROR)
+# DATA IO (FIXES YOUR IMPORT ISSUES)
 # ─────────────────────────────────────────────
 
 def load_draws(filepath):
-    """
-    Expects CSV with columns like:
-    date, n1, n2, n3, n4, n5, special (optional)
-
-    Returns:
-    [
-        {"balls": [1,2,3,4,5]},
-        ...
-    ]
-    """
     rows = []
+
+    if not os.path.exists(filepath):
+        return rows
 
     with open(filepath, "r") as f:
         reader = csv.reader(f)
-        header = next(reader)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return rows
 
         for row in reader:
             try:
@@ -60,6 +57,18 @@ def load_draws(filepath):
                 continue
 
     return rows
+
+
+def save_draws(filepath, rows):
+    """
+    Saves draws back to CSV.
+    """
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "n1", "n2", "n3", "n4", "n5"])
+
+        for i, r in enumerate(rows):
+            writer.writerow([i] + r["balls"])
 
 # ─────────────────────────────────────────────
 # UTILITIES
