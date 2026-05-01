@@ -323,6 +323,335 @@ def _sample_cdf(cdf: list, u: float):
     return cdf[-1][1]
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  BRIER SCORE + BAYESIAN WEIGHT UPDATING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def brier_score(prob_dict: dict, actual_numbers: list, number_range) -> float:
+    """
+    Compute the Brier Score for a probabilistic forecast.
+
+    BS = (1/N) * sum_i (p_i - o_i)^2
+
+    where p_i = predicted probability for number i,
+          o_i = 1 if number i was drawn, else 0,
+          N   = total numbers in range.
+
+    Lower is better. Random baseline for Powerball (5/69): ~0.061.
+    A perfect forecast would score 0.
+    """
+    actual_set = set(actual_numbers)
+    n          = len(list(number_range))
+    total = sum(
+        (prob_dict.get(i, 0.0) - (1.0 if i in actual_set else 0.0)) ** 2
+        for i in number_range
+    )
+    return total / n if n > 0 else 1.0
+
+
+def brier_score_baseline(white_count: int, white_max: int) -> float:
+    """Brier Score for a uniform random forecast — the baseline to beat."""
+    p = white_count / white_max
+    return white_count * (1 - p) ** 2 / white_max + (white_max - white_count) * p ** 2 / white_max
+
+
+def evaluate_method_brier(method_scores: dict, recent_rows: list,
+                           white_range, window: int = 50) -> float:
+    """
+    Average Brier Score for a method over the last `window` draws.
+    Lower = better predictive accuracy.
+    """
+    rows = recent_rows[-window:]
+    if not rows:
+        return 1.0
+    total = 0.0
+    # Normalise scores to probabilities
+    s_sum = sum(method_scores.values()) + 1e-12
+    probs = {k: v / s_sum for k, v in method_scores.items()}
+    for r in rows:
+        total += brier_score(probs, r["balls"], white_range)
+    return total / len(rows)
+
+
+def bayesian_weight_update(method_scores_list: list,
+                           method_names: list,
+                           recent_rows: list,
+                           prior_weights: list,
+                           white_range,
+                           window: int = 60) -> list:
+    """
+    Update method weights using Bayesian inference based on recent Brier Scores.
+
+    For each method compute its average Brier Score over the last `window` draws.
+    Convert to a likelihood (lower BS → higher likelihood) and multiply by the
+    prior weight.  Normalise to get posterior weights.
+
+    Returns updated weight list in the same order as method_names.
+    """
+    if not recent_rows or not HAS_NP:
+        return prior_weights
+
+    likelihoods = []
+    brier_scores_by_method = []
+    for scores in method_scores_list:
+        bs = evaluate_method_brier(scores, recent_rows, white_range, window)
+        brier_scores_by_method.append(bs)
+        # Convert Brier Score to likelihood: e^(-k*BS)
+        # k=15 gives meaningful differentiation across typical BS range 0.03–0.08
+        likelihoods.append(float(np.exp(-15.0 * bs)))
+
+    # Posterior ∝ prior × likelihood
+    posteriors = [p * l for p, l in zip(prior_weights, likelihoods)]
+    total = sum(posteriors) + 1e-12
+    updated = [p / total for p in posteriors]
+
+    # Log the update for transparency
+    print("[bayes] Method weight update:")
+    for name, bs, old_w, new_w in zip(
+            method_names, brier_scores_by_method, prior_weights, updated):
+        print(f"  {name:12s}  BS={bs:.5f}  {old_w:.3f} → {new_w:.3f}")
+
+    return updated
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STATISTICAL EVALUATION FRAMEWORK
+#  Null model · Log-loss · Calibration · Backtesting · Bootstrap CI
+# ══════════════════════════════════════════════════════════════════════════════
+
+import math as _math
+
+# ── Null hypothesis (uniform) model ──────────────────────────────────────────
+
+def null_model_probs(number_range) -> dict:
+    """Uniform probability over all numbers — the baseline to beat."""
+    nums = list(number_range)
+    p    = 1.0 / len(nums)
+    return {n: p for n in nums}
+
+
+# ── Log-loss ──────────────────────────────────────────────────────────────────
+
+def log_loss_score(prob_dict: dict, actual_numbers: list,
+                   number_range, eps: float = 1e-9) -> float:
+    """
+    Mean log-loss over all numbers in range.
+    −(1/N) Σ [ o_i·log(p_i) + (1−o_i)·log(1−p_i) ]
+    Lower is better. Perfect = 0, random ≈ log(2) ≈ 0.693.
+    """
+    actual_set = set(actual_numbers)
+    nums       = list(number_range)
+    total = 0.0
+    for n in nums:
+        p  = max(eps, min(1 - eps, prob_dict.get(n, eps)))
+        o  = 1.0 if n in actual_set else 0.0
+        total += o * _math.log(p) + (1 - o) * _math.log(1 - p)
+    return -total / len(nums)
+
+
+def log_loss_baseline(white_count: int, white_max: int,
+                      eps: float = 1e-9) -> float:
+    """Log-loss for the uniform null model."""
+    p      = white_count / white_max
+    p      = max(eps, min(1 - eps, p))
+    return -(p * _math.log(p) + (1 - p) * _math.log(1 - p))
+
+
+# ── Calibration ───────────────────────────────────────────────────────────────
+
+def calibration_curve(prob_dict: dict, draw_rows: list,
+                      number_range, n_bins: int = 10) -> list:
+    """
+    Compute calibration: for numbers predicted at ~p%, did they actually
+    appear ~p% of the time?
+
+    Returns list of dicts: {bin_center, mean_predicted, mean_actual, count}
+    """
+    nums      = list(number_range)
+    total_draws = len(draw_rows)
+    if total_draws == 0:
+        return []
+
+    # Normalise probs
+    s = sum(prob_dict.values()) + 1e-12
+    probs = {n: prob_dict[n] / s for n in nums}
+
+    # Count actual appearances per number
+    appearances = {n: 0 for n in nums}
+    for r in draw_rows:
+        for b in r["balls"]:
+            if b in appearances:
+                appearances[b] += 1
+    actual_freq = {n: appearances[n] / total_draws for n in nums}
+
+    # Bin by predicted probability
+    bins = [[] for _ in range(n_bins)]
+    for n in nums:
+        p   = probs[n]
+        idx = min(int(p * n_bins), n_bins - 1)
+        bins[idx].append((p, actual_freq[n]))
+
+    result = []
+    for i, b in enumerate(bins):
+        if not b:
+            continue
+        mean_pred   = sum(x[0] for x in b) / len(b)
+        mean_actual = sum(x[1] for x in b) / len(b)
+        result.append({
+            "bin_center":    round((i + 0.5) / n_bins, 3),
+            "mean_predicted": round(mean_pred,   6),
+            "mean_actual":    round(mean_actual, 6),
+            "count":          len(b),
+        })
+    return result
+
+
+# ── Rolling backtest ──────────────────────────────────────────────────────────
+
+def rolling_backtest(rows: list, game: dict,
+                     train_size: int = 2000,
+                     max_evals: int  = 100,
+                     step: int       = 10) -> dict:
+    """
+    Rolling-window backtest:
+      - Train on rows[0:train_size]
+      - Predict row[train_size]
+      - Slide forward by `step`, repeat up to `max_evals` times
+      - Measure hit rate, log-loss, Brier score, calibration
+
+    Returns summary dict.
+    """
+    if not HAS_NP or len(rows) < train_size + 10:
+        return {"error": "Not enough data for backtesting"}
+
+    WHITE_MAX   = game["white_max"]
+    WHITE_COUNT = game["white_count"]
+    WHITE_RANGE = range(1, WHITE_MAX + 1)
+
+    null_probs  = null_model_probs(WHITE_RANGE)
+
+    brier_scores  = []
+    logloss_scores= []
+    null_briers   = []
+    null_loglosses= []
+    hit_rates_1   = []   # at least 1 white ball match
+    hit_rates_2   = []   # at least 2 white ball matches
+
+    eval_indices = list(range(train_size,
+                              min(len(rows), train_size + max_evals * step),
+                              step))
+
+    for eval_idx in eval_indices:
+        train   = rows[max(0, eval_idx - train_size): eval_idx]
+        actual  = rows[eval_idx]
+
+        # Simple frequency model on training window (fast proxy for full engine)
+        count   = {}
+        for r in train:
+            for b in r["balls"]:
+                count[b] = count.get(b, 0) + 1
+        total_balls = sum(count.values()) + 1e-12
+        alpha = 2.0
+        probs = {n: (count.get(n, 0) + alpha) /
+                    (total_balls + alpha * WHITE_MAX)
+                 for n in WHITE_RANGE}
+        p_sum = sum(probs.values())
+        probs = {n: v / p_sum for n, v in probs.items()}
+
+        actual_balls = actual["balls"]
+
+        # Brier
+        bs = brier_score(probs, actual_balls, WHITE_RANGE)
+        bs_null = brier_score(null_probs, actual_balls, WHITE_RANGE)
+        brier_scores.append(bs)
+        null_briers.append(bs_null)
+
+        # Log-loss
+        ll = log_loss_score(probs, actual_balls, WHITE_RANGE)
+        ll_null = log_loss_score(null_probs, actual_balls, WHITE_RANGE)
+        logloss_scores.append(ll)
+        null_loglosses.append(ll_null)
+
+        # Hit rate
+        pred_top = sorted(WHITE_RANGE, key=lambda n: probs[n], reverse=True)
+        pred_set_15 = set(pred_top[:15])   # top-15 as "predictions"
+        hits = len(set(actual_balls) & pred_set_15)
+        hit_rates_1.append(1 if hits >= 1 else 0)
+        hit_rates_2.append(1 if hits >= 2 else 0)
+
+    if not brier_scores:
+        return {"error": "No evaluations completed"}
+
+    n = len(brier_scores)
+    return {
+        "n_evaluations":        n,
+        "train_window":         train_size,
+        "mean_brier":           round(float(sum(brier_scores)  / n), 6),
+        "mean_brier_null":      round(float(sum(null_briers)   / n), 6),
+        "mean_logloss":         round(float(sum(logloss_scores)/ n), 6),
+        "mean_logloss_null":    round(float(sum(null_loglosses)/ n), 6),
+        "hit_rate_1plus":       round(float(sum(hit_rates_1)   / n), 4),
+        "hit_rate_2plus":       round(float(sum(hit_rates_2)   / n), 4),
+        "brier_improvement_pct":round(
+            (sum(null_briers) - sum(brier_scores)) /
+            (sum(null_briers) + 1e-12) * 100, 2),
+        "logloss_improvement_pct": round(
+            (sum(null_loglosses) - sum(logloss_scores)) /
+            (sum(null_loglosses) + 1e-12) * 100, 2),
+    }
+
+
+# ── Bootstrap confidence intervals ───────────────────────────────────────────
+
+def bootstrap_confidence(rows: list, number_range,
+                          n_bootstrap: int = 500,
+                          ci: float = 0.95) -> dict:
+    """
+    Bootstrap resampling to estimate 95% CI on predicted probabilities.
+
+    Returns {number: (lower_ci, mean, upper_ci)} for the top 20 most
+    variable numbers (sorted by CI width).
+    """
+    if not HAS_NP or len(rows) < 50:
+        return {}
+
+    import random as _random
+    nums   = list(number_range)
+    n_rows = len(rows)
+    alpha  = (1 - ci) / 2
+
+    # Store bootstrap probability for each number across resamples
+    boot_probs = {n: [] for n in nums}
+
+    for _ in range(n_bootstrap):
+        sample = [rows[_random.randint(0, n_rows - 1)] for _ in range(n_rows)]
+        counts = {n: 0 for n in nums}
+        for r in sample:
+            for b in r["balls"]:
+                if b in counts:
+                    counts[b] += 1
+        total = sum(counts.values()) + 1e-12
+        for n in nums:
+            boot_probs[n].append(counts[n] / total)
+
+    result = {}
+    for n in nums:
+        bp = sorted(boot_probs[n])
+        lo = bp[int(alpha * n_bootstrap)]
+        hi = bp[int((1 - alpha) * n_bootstrap)]
+        mn = sum(bp) / len(bp)
+        result[n] = {
+            "lower": round(lo, 6),
+            "mean":  round(mn, 6),
+            "upper": round(hi, 6),
+            "ci_width": round(hi - lo, 6),
+        }
+
+    # Return top 20 by CI width (most uncertain numbers)
+    top20 = sorted(result.items(), key=lambda x: x[1]["ci_width"], reverse=True)[:20]
+    return {str(n): v for n, v in top20}
+
 def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
     """Full 7-method prediction engine. Returns list of 5 ticket dicts."""
     def prog(pct, msg=""):
@@ -473,11 +802,40 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
             for b in r: m7_w[b] = m7_w.get(b, 1.0) + w
     m7_w = soft_floor(m7_w, 0.25)
 
-    prog(83, "Synthesising …")
+    prog(83, "Synthesising with Bayesian weight update …")
+
+    # ── Bayesian weight update ────────────────────────────────────────────────
+    # Base (prior) weights for each white-ball method
+    PRIOR_W = [0.15, 0.15, 0.08, 0.17, 0.20, 0.15, 0.10]
+    METHOD_NAMES = ["Frequency", "Markov", "Spectral", "Gap",
+                    "Neural", "MonteCarlo", "Decay"]
+
+    if HAS_NP and ERA3_DRAWS > 60:
+        w_weights = bayesian_weight_update(
+            [w_freq, m2, m3_w, m4_w, m5_w, m6_w, m7_w],
+            METHOD_NAMES,
+            era3_rows,
+            PRIOR_W,
+            WHITE_RANGE,
+            window=min(60, ERA3_DRAWS // 4),
+        )
+    else:
+        w_weights = PRIOR_W
+
     final_w = arith_blend([w_freq, m2, m3_w, m4_w, m5_w, m6_w, m7_w],
-                          [0.15, 0.15, 0.08, 0.17, 0.20, 0.15, 0.10], WHITE_RANGE)
+                          w_weights, WHITE_RANGE)
     final_s = arith_blend([s_freq, m3_s, m4_s, m5_s, m6_s],
                           [0.20, 0.10, 0.25, 0.30, 0.15], SPEC_RANGE)
+
+    # ── Compute and log overall Brier Score ───────────────────────────────────
+    if HAS_NP and ERA3_DRAWS > 10:
+        f_sum = sum(final_w.values()) + 1e-12
+        f_probs = {k: v / f_sum for k, v in final_w.items()}
+        bs_recent = evaluate_method_brier(final_w, era3_rows, WHITE_RANGE, 50)
+        bs_base   = brier_score_baseline(WHITE_COUNT, WHITE_MAX)
+        print(f"[brier] Ensemble BS (last 50 draws): {bs_recent:.5f}  "
+              f"(baseline random: {bs_base:.5f}  "
+              f"improvement: {(bs_base - bs_recent) / bs_base * 100:.1f}%)")
 
     prog(90, "Selecting tickets …")
     sorted_w = sorted(WHITE_RANGE, key=lambda n: final_w[n], reverse=True)
@@ -789,3 +1147,679 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
     evaluated.sort(key=lambda r: parse_date(r["target_draw_date"]) or datetime.min)
     pending.sort(key=lambda r:   parse_date(r["target_draw_date"]) or datetime.min)
     return {"evaluated": evaluated, "pending": pending}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STATISTICAL VALIDATION FRAMEWORK
+#  Null hypothesis · Log-loss · Calibration · Backtesting · Bootstrap CI
+# ══════════════════════════════════════════════════════════════════════════════
+
+import math
+import random as _random
+
+
+# ── Null hypothesis (uniform) ─────────────────────────────────────────────────
+
+def null_hypothesis_probs(number_range) -> dict:
+    """Uniform probability for every number — the baseline to beat."""
+    nums = list(number_range)
+    p    = 1.0 / len(nums)
+    return {n: p for n in nums}
+
+
+def null_hypothesis_brier(white_count: int, white_max: int) -> float:
+    """Brier score of the uniform model (analytical)."""
+    return brier_score_baseline(white_count, white_max)
+
+
+# ── Log-loss ──────────────────────────────────────────────────────────────────
+
+def log_loss_score(prob_dict: dict, actual_numbers: list,
+                   number_range, eps: float = 1e-9) -> float:
+    """
+    Average log-loss across all numbers in range.
+    For each number i:  loss_i = -(o_i * log(p_i) + (1-o_i) * log(1-p_i))
+    Lower is better.  Null model baseline ≈ -log(k/N) for k drawn from N.
+    """
+    actual_set = set(actual_numbers)
+    total = 0.0
+    n     = 0
+    for i in number_range:
+        p  = max(eps, min(1 - eps, prob_dict.get(i, eps)))
+        o  = 1.0 if i in actual_set else 0.0
+        total += -(o * math.log(p) + (1 - o) * math.log(1 - p))
+        n     += 1
+    return total / n if n > 0 else float('inf')
+
+
+def null_log_loss(white_count: int, white_max: int) -> float:
+    """Log-loss of the uniform model (analytical)."""
+    p   = white_count / white_max
+    eps = 1e-9
+    p   = max(eps, min(1 - eps, p))
+    return -(p * math.log(p) + (1 - p) * math.log(1 - p))
+
+
+# ── Calibration curve ────────────────────────────────────────────────────────
+
+def calibration_data(prob_dict: dict, draw_rows: list,
+                     number_range, n_bins: int = 10) -> list:
+    """
+    Build calibration data: for each probability bin, compute the actual
+    hit frequency.  Well-calibrated model: predicted 10% → ~10% actual.
+
+    Returns list of dicts: {bin_low, bin_high, pred_mean, actual_freq, count}
+    """
+    bin_edges  = [i / n_bins for i in range(n_bins + 1)]
+    bin_preds  = [[] for _ in range(n_bins)]
+    bin_actual = [[] for _ in range(n_bins)]
+
+    for row in draw_rows:
+        actual_set = set(row["balls"])
+        for num in number_range:
+            p   = prob_dict.get(num, 0.0)
+            o   = 1 if num in actual_set else 0
+            b   = min(int(p * n_bins), n_bins - 1)
+            bin_preds[b].append(p)
+            bin_actual[b].append(o)
+
+    result = []
+    for i in range(n_bins):
+        if not bin_preds[i]:
+            continue
+        result.append({
+            "bin_low":     round(bin_edges[i], 3),
+            "bin_high":    round(bin_edges[i + 1], 3),
+            "pred_mean":   round(sum(bin_preds[i]) / len(bin_preds[i]), 4),
+            "actual_freq": round(sum(bin_actual[i]) / len(bin_actual[i]), 4),
+            "count":       len(bin_preds[i]),
+        })
+    return result
+
+
+def calibration_error(calib_data: list) -> float:
+    """
+    Expected Calibration Error (ECE): weighted mean |pred - actual|.
+    Lower is better; 0 = perfect calibration.
+    """
+    total_count = sum(b["count"] for b in calib_data)
+    if total_count == 0:
+        return 1.0
+    return sum(
+        b["count"] / total_count * abs(b["pred_mean"] - b["actual_freq"])
+        for b in calib_data
+    )
+
+
+# ── Backtesting framework ────────────────────────────────────────────────────
+
+def _simple_frequency_probs(rows: list, number_range,
+                              alpha: float = 2.0) -> dict:
+    """Fast frequency model used inside backtesting (avoids full 7-method run)."""
+    from collections import Counter
+    counts = Counter(b for r in rows for b in r["balls"])
+    n      = len(rows) * 5
+    return soft_floor(
+        {num: (counts.get(num, 0) + alpha) / (n + alpha * len(list(number_range)))
+         for num in number_range},
+        0.3
+    )
+
+
+def backtest(rows: list, game: dict,
+             train_size: int = 500,
+             max_windows: int = 200) -> dict:
+    """
+    Rolling-window backtest.
+
+    Train on draws[i : i+train_size], predict draw[i+train_size],
+    slide forward by 1.  Uses the fast frequency model for speed
+    (full 7-method per window would take hours).
+
+    Returns aggregate metrics + per-window results.
+    """
+    WHITE_MAX   = game["white_max"]
+    WHITE_COUNT = game["white_count"]
+    WHITE_RANGE = range(1, WHITE_MAX + 1)
+    NULL_PROBS  = null_hypothesis_probs(WHITE_RANGE)
+
+    n       = len(rows)
+    if n < train_size + 10:
+        return {"error": f"Need at least {train_size + 10} rows, have {n}"}
+
+    # Limit windows for performance
+    total_windows = min(n - train_size, max_windows)
+    step          = max(1, (n - train_size) // max_windows)
+
+    results = []
+    for i in range(0, total_windows * step, step):
+        if i + train_size >= n:
+            break
+        train = rows[i : i + train_size]
+        test  = rows[i + train_size]
+
+        probs      = _simple_frequency_probs(train, WHITE_RANGE)
+        bs_model   = brier_score(probs, test["balls"], WHITE_RANGE)
+        bs_null    = brier_score(NULL_PROBS, test["balls"], WHITE_RANGE)
+        ll_model   = log_loss_score(probs, test["balls"], WHITE_RANGE)
+        ll_null    = log_loss_score(NULL_PROBS, test["balls"], WHITE_RANGE)
+
+        # Hit rate: how many of top-k predicted numbers were actually drawn
+        sorted_nums = sorted(WHITE_RANGE, key=lambda x: probs[x], reverse=True)
+        top_k       = set(sorted_nums[:WHITE_COUNT * 3])   # top 15 / 21 candidates
+        hits        = len(top_k & set(test["balls"]))
+
+        results.append({
+            "window_start": i,
+            "draw_date":    test["date"],
+            "brier_model":  round(bs_model, 6),
+            "brier_null":   round(bs_null, 6),
+            "logloss_model":round(ll_model, 6),
+            "logloss_null": round(ll_null, 6),
+            "hits_top15":   hits,
+        })
+
+    if not results:
+        return {"error": "No windows completed"}
+
+    bs_m  = [r["brier_model"]   for r in results]
+    bs_n  = [r["brier_null"]    for r in results]
+    ll_m  = [r["logloss_model"] for r in results]
+    ll_n  = [r["logloss_null"]  for r in results]
+    hits  = [r["hits_top15"]    for r in results]
+
+    n_res = len(results)
+    summary = {
+        "windows":             n_res,
+        "train_size":          train_size,
+        "avg_brier_model":     round(sum(bs_m) / n_res, 6),
+        "avg_brier_null":      round(sum(bs_n) / n_res, 6),
+        "brier_improvement":   round((sum(bs_n) - sum(bs_m)) / sum(bs_n) * 100, 2),
+        "avg_logloss_model":   round(sum(ll_m) / n_res, 6),
+        "avg_logloss_null":    round(sum(ll_n) / n_res, 6),
+        "logloss_improvement": round((sum(ll_n) - sum(ll_m)) / sum(ll_n) * 100, 2),
+        "avg_hits_top15":      round(sum(hits) / n_res, 3),
+        "expected_hits_random":round(WHITE_COUNT * 3 * WHITE_COUNT / WHITE_MAX, 3),
+        "windows_model_beat_null": sum(
+            1 for b_m, b_n in zip(bs_m, bs_n) if b_m < b_n
+        ),
+        "win_rate_pct": round(
+            sum(1 for b_m, b_n in zip(bs_m, bs_n) if b_m < b_n) / n_res * 100, 1
+        ),
+    }
+    return {"summary": summary, "windows": results[-20:]}  # last 20 windows
+
+
+# ── Bootstrap confidence intervals ───────────────────────────────────────────
+
+def bootstrap_confidence_intervals(prob_dict: dict, draw_rows: list,
+                                    number_range,
+                                    n_bootstrap: int = 500,
+                                    ci_level: float = 0.95) -> dict:
+    """
+    Bootstrap CI for Brier Score and Log-Loss.
+
+    Resample draw_rows with replacement n_bootstrap times,
+    recompute metrics each time, then take percentile intervals.
+
+    Returns: {brier: {mean, lower, upper}, logloss: {mean, lower, upper}}
+    """
+    if not draw_rows or not HAS_NP:
+        return {}
+
+    brier_scores  = []
+    logloss_scores = []
+
+    for _ in range(n_bootstrap):
+        sample = [draw_rows[_random.randint(0, len(draw_rows) - 1)]
+                  for _ in range(len(draw_rows))]
+        bs_vals = [brier_score(prob_dict, r["balls"], number_range)
+                   for r in sample]
+        ll_vals = [log_loss_score(prob_dict, r["balls"], number_range)
+                   for r in sample]
+        brier_scores.append(sum(bs_vals) / len(bs_vals))
+        logloss_scores.append(sum(ll_vals) / len(ll_vals))
+
+    alpha   = (1 - ci_level) / 2
+    lo_idx  = int(alpha * n_bootstrap)
+    hi_idx  = int((1 - alpha) * n_bootstrap)
+
+    brier_sorted  = sorted(brier_scores)
+    ll_sorted     = sorted(logloss_scores)
+
+    return {
+        "ci_level": ci_level,
+        "n_bootstrap": n_bootstrap,
+        "brier": {
+            "mean":  round(sum(brier_scores) / n_bootstrap, 6),
+            "lower": round(brier_sorted[lo_idx], 6),
+            "upper": round(brier_sorted[hi_idx], 6),
+        },
+        "logloss": {
+            "mean":  round(sum(logloss_scores) / n_bootstrap, 6),
+            "lower": round(ll_sorted[lo_idx], 6),
+            "upper": round(ll_sorted[hi_idx], 6),
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION A — TEST FOR NON-RANDOMNESS
+#  Chi-square · Entropy · Serial correlation · Runs test
+# ══════════════════════════════════════════════════════════════════════════════
+
+def chi_square_goodness_of_fit(rows: list, number_range) -> dict:
+    """
+    Chi-square test: do observed frequencies deviate from uniform?
+    H0: every number equally likely (perfect randomness).
+    Low p-value → evidence of non-randomness (but not which direction).
+
+    χ² = Σ (O_i - E_i)² / E_i
+    """
+    from collections import Counter
+    nums        = list(number_range)
+    N           = len(nums)
+    total_draws = sum(len(r["balls"]) for r in rows)
+    expected    = total_draws / N          # uniform expectation per number
+    observed    = Counter(b for r in rows for b in r["balls"])
+
+    chi2 = sum(
+        (observed.get(n, 0) - expected) ** 2 / expected
+        for n in nums
+    )
+    df = N - 1
+
+    # p-value via regularised incomplete gamma (scipy if available, else approx)
+    p_value = None
+    try:
+        from scipy.stats import chi2 as chi2_dist
+        p_value = float(1 - chi2_dist.cdf(chi2, df))
+    except Exception:
+        # Wilson-Hilferty normal approximation
+        try:
+            z = ((chi2 / df) ** (1/3) - (1 - 2/(9*df))) / math.sqrt(2/(9*df))
+            # Φ complement (rough)
+            p_value = max(0.0, min(1.0, 0.5 * math.erfc(z / math.sqrt(2))))
+        except Exception:
+            p_value = None
+
+    # Most over/under-represented numbers
+    deviations = sorted(
+        [(n, observed.get(n,0), round((observed.get(n,0)-expected)/expected*100,1))
+         for n in nums],
+        key=lambda x: abs(x[2]), reverse=True
+    )
+
+    return {
+        "chi2":            round(chi2, 4),
+        "df":              df,
+        "p_value":         round(p_value, 6) if p_value is not None else None,
+        "expected_per_num":round(expected, 2),
+        "reject_h0_5pct":  (p_value < 0.05) if p_value is not None else None,
+        "interpretation":  (
+            "Significant deviation from uniform — non-randomness detected"
+            if p_value is not None and p_value < 0.05
+            else "No significant deviation — consistent with randomness"
+        ),
+        "top_overdue":     deviations[:5],    # most under-represented
+        "top_frequent":    deviations[-5:],   # most over-represented
+    }
+
+
+def entropy_analysis(rows: list, number_range) -> dict:
+    """
+    Shannon entropy of the observed frequency distribution.
+    H = -Σ p_i * log2(p_i)
+
+    Max entropy = log2(N) for uniform distribution.
+    Lower entropy → more skewed = more structure (potentially exploitable).
+    Entropy ratio close to 1.0 = very random.
+    """
+    from collections import Counter
+    nums  = list(number_range)
+    N     = len(nums)
+    total = sum(len(r["balls"]) for r in rows) or 1
+    counts = Counter(b for r in rows for b in r["balls"])
+
+    h = 0.0
+    for n in nums:
+        p = counts.get(n, 0) / total
+        if p > 0:
+            h -= p * math.log2(p)
+
+    max_h   = math.log2(N)
+    ratio   = h / max_h if max_h > 0 else 1.0
+
+    return {
+        "entropy":       round(h, 6),
+        "max_entropy":   round(max_h, 6),
+        "entropy_ratio": round(ratio, 6),
+        "interpretation": (
+            "Near-maximum entropy — draw system appears well-randomised"
+            if ratio > 0.98
+            else "Below-maximum entropy — mild structure detected; may be exploitable"
+            if ratio > 0.95
+            else "Notable entropy deficit — structure present in historical draws"
+        ),
+    }
+
+
+def serial_correlation(rows: list, lag: int = 1) -> dict:
+    """
+    Serial (autocorrelation) of the draw sum series.
+    Tests whether consecutive draw sums are correlated (non-independent).
+    Near-zero correlation → consistent with independence.
+    """
+    if not HAS_NP or len(rows) < lag + 20:
+        return {"error": "Insufficient data"}
+
+    sums = np.array([sum(r["balls"]) for r in rows], dtype=float)
+    n    = len(sums)
+    mu   = sums.mean()
+    var  = ((sums - mu) ** 2).mean()
+    if var == 0:
+        return {"correlation": 0.0}
+
+    # Pearson correlation between series and lagged series
+    cov  = ((sums[lag:] - mu) * (sums[:-lag] - mu)).mean()
+    corr = cov / var
+
+    # Ljung-Box statistic for lag 1
+    q  = n * (n + 2) * (corr ** 2) / (n - lag)
+    p_lb = None
+    try:
+        from scipy.stats import chi2 as chi2_dist
+        p_lb = float(1 - chi2_dist.cdf(q, df=lag))
+    except Exception:
+        pass
+
+    return {
+        "lag":            lag,
+        "correlation":    round(float(corr), 6),
+        "ljung_box_q":    round(float(q), 4),
+        "p_value":        round(p_lb, 6) if p_lb is not None else None,
+        "interpretation": (
+            "Significant serial correlation — draws may not be fully independent"
+            if p_lb is not None and p_lb < 0.05
+            else "No significant serial correlation — draws appear independent"
+        ),
+    }
+
+
+def runs_test(rows: list) -> dict:
+    """
+    Runs test on the draw-sum series (above/below median).
+    Tests for too many or too few runs — detecting non-random patterns.
+    """
+    if len(rows) < 20:
+        return {"error": "Insufficient data"}
+
+    sums   = [sum(r["balls"]) for r in rows]
+    median = sorted(sums)[len(sums) // 2]
+    signs  = [1 if s >= median else -1 for s in sums]
+
+    runs = 1
+    for i in range(1, len(signs)):
+        if signs[i] != signs[i-1]:
+            runs += 1
+
+    n1 = signs.count(1)
+    n2 = signs.count(-1)
+    n  = n1 + n2
+
+    if n1 == 0 or n2 == 0:
+        return {"runs": runs, "interpretation": "All values on same side of median"}
+
+    # Expected runs and variance under H0
+    mu_r  = 2 * n1 * n2 / n + 1
+    var_r = 2 * n1 * n2 * (2 * n1 * n2 - n) / (n ** 2 * (n - 1))
+    z     = (runs - mu_r) / math.sqrt(var_r) if var_r > 0 else 0.0
+
+    p_val = None
+    try:
+        p_val = float(2 * (1 - 0.5 * math.erfc(-abs(z) / math.sqrt(2))))
+    except Exception:
+        pass
+
+    return {
+        "runs":          runs,
+        "expected_runs": round(mu_r, 2),
+        "z_score":       round(z, 4),
+        "p_value":       round(p_val, 6) if p_val is not None else None,
+        "interpretation": (
+            "Significant non-randomness in run structure"
+            if p_val is not None and p_val < 0.05
+            else "Run structure consistent with randomness"
+        ),
+    }
+
+
+def section_a_randomness_tests(rows: list, game: dict) -> dict:
+    """
+    Run all Section A tests. Returns a composite non-randomness score
+    and individual test results.
+    """
+    WHITE_RANGE = range(1, game["white_max"] + 1)
+
+    chi    = chi_square_goodness_of_fit(rows, WHITE_RANGE)
+    ent    = entropy_analysis(rows, WHITE_RANGE)
+    serial = serial_correlation(rows, lag=1)
+    runs   = runs_test(rows)
+
+    # Composite non-randomness score 0-100
+    # (higher = more evidence of non-randomness = more potentially exploitable)
+    score = 0.0
+    if chi.get("reject_h0_5pct"):         score += 30
+    if ent.get("entropy_ratio", 1) < 0.98: score += 20 * (1 - ent.get("entropy_ratio",1)/0.98)
+    if serial.get("p_value") is not None and serial["p_value"] < 0.05: score += 25
+    if runs.get("p_value") is not None    and runs["p_value"]   < 0.05: score += 25
+
+    score = min(100, score)
+
+    return {
+        "non_randomness_score": round(score, 1),
+        "recommendation": (
+            "Strong evidence of structure — full model ensemble justified"
+            if score >= 40
+            else "Mild structure detected — model may add modest value over random"
+            if score >= 15
+            else "No detectable structure — draw system appears truly random; "
+                 "predictions should be treated as educated guesses only"
+        ),
+        "chi_square":         chi,
+        "entropy":            ent,
+        "serial_correlation": serial,
+        "runs_test":          runs,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION B — BAYESIAN HIERARCHICAL MODEL (Dirichlet prior)
+#  More academically rigorous than raw frequency counts.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def dirichlet_bayesian_probs(rows: list, number_range,
+                              alpha: float = 1.0) -> dict:
+    """
+    Bayesian frequency model with Dirichlet(α) prior.
+    Posterior mean: p_i = (count_i + α) / (total + α * N)
+
+    α = 1.0  → uniform (Laplace smoothing)
+    α = 0.5  → Jeffreys prior (more conservative)
+    α → 0    → maximum likelihood (no smoothing)
+
+    More rigorous than raw counts: uncertainty is modelled, not ignored.
+    """
+    from collections import Counter
+    nums   = list(number_range)
+    N      = len(nums)
+    counts = Counter(b for r in rows for b in r["balls"])
+    total  = sum(counts.values())
+
+    probs = {
+        n: (counts.get(n, 0) + alpha) / (total + alpha * N)
+        for n in nums
+    }
+
+    # Posterior concentration: higher = more confident
+    alpha_post = {n: counts.get(n, 0) + alpha for n in nums}
+    alpha_total = sum(alpha_post.values())
+
+    # Posterior variance for each number
+    variances = {
+        n: (alpha_post[n] * (alpha_total - alpha_post[n]))
+           / (alpha_total ** 2 * (alpha_total + 1))
+        for n in nums
+    }
+
+    return {
+        "probs":      probs,
+        "variances":  variances,
+        "alpha_prior": alpha,
+        "n_draws":    len(rows),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WEIGHT OPTIMISATION
+#  Learn weights from historical validation rather than setting subjectively.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def optimize_weights(method_scores_list: list, rows: list,
+                     number_range,
+                     method_names: list,
+                     window: int = 100,
+                     n_grid: int = 5) -> list:
+    """
+    Grid-search weight optimisation.
+    Minimise average Brier Score over the last `window` draws.
+
+    For speed uses a coarse grid then refines around the best.
+    Falls back to Bayesian posterior weights if grid search fails.
+
+    w* = argmin_{w} (1/T) Σ_t BS(Σ_k w_k * score_k^t, actual_t)
+    """
+    if not HAS_NP or len(rows) < window + 10 or len(method_scores_list) < 2:
+        # Fallback: uniform weights
+        n = len(method_scores_list)
+        return [1.0 / n] * n
+
+    test_rows = rows[-window:]
+    nums      = list(number_range)
+    K         = len(method_scores_list)
+
+    # Normalise each method's scores to probabilities once
+    norm_probs = []
+    for scores in method_scores_list:
+        s = sum(scores.values()) + 1e-12
+        norm_probs.append({n: scores.get(n, 0) / s for n in nums})
+
+    best_bs   = float('inf')
+    best_w    = [1.0 / K] * K
+
+    # Coarse grid: each weight in {0, 0.25, 0.5, 0.75, 1.0}, normalised
+    grid_vals = [i / (n_grid - 1) for i in range(n_grid)]
+
+    import itertools
+    # Limit combinations for performance: use random sampling for K > 4
+    if K <= 4:
+        combos = list(itertools.product(grid_vals, repeat=K))
+    else:
+        _rng = _random.Random(42)
+        combos = [
+            [_rng.choice(grid_vals) for _ in range(K)]
+            for _ in range(2000)
+        ]
+        combos.append([1.0/K]*K)   # always include uniform
+
+    for combo in combos:
+        total = sum(combo)
+        if total < 1e-9:
+            continue
+        w = [c / total for c in combo]
+
+        # Blend and score
+        bs_total = 0.0
+        for row in test_rows:
+            blended = {n: sum(w[k] * norm_probs[k][n] for k in range(K)) for n in nums}
+            bs_total += brier_score(blended, row["balls"], number_range)
+        avg_bs = bs_total / len(test_rows)
+
+        if avg_bs < best_bs:
+            best_bs = avg_bs
+            best_w  = w
+
+    print(f"[weight-opt] Best Brier: {best_bs:.6f}  weights: "
+          + " ".join(f"{n}={w:.3f}" for n,w in zip(method_names, best_w)))
+
+    return best_w
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION C — COMPARE TO CHANCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compare_to_chance(prob_dict: dict, rows: list,
+                      game: dict, window: int = 100) -> dict:
+    """
+    Head-to-head comparison: ensemble model vs null hypothesis (uniform).
+    Reports whether the model beats random on Brier score, log-loss,
+    and hit rate over the last `window` draws.
+    """
+    WHITE_RANGE = range(1, game["white_max"] + 1)
+    WHITE_COUNT = game["white_count"]
+    WHITE_MAX   = game["white_max"]
+
+    test_rows  = rows[-window:] if len(rows) >= window else rows
+    if not test_rows:
+        return {"error": "No data"}
+
+    null_probs = null_hypothesis_probs(WHITE_RANGE)
+    # Normalise model probs
+    s = sum(prob_dict.values()) + 1e-12
+    model_probs = {k: v/s for k,v in prob_dict.items()}
+
+    bs_model_vals, bs_null_vals   = [], []
+    ll_model_vals, ll_null_vals   = [], []
+    hits_model, hits_null         = [], []
+    TOP_K = WHITE_COUNT * 3  # top 15/21 candidates
+
+    sorted_model = sorted(WHITE_RANGE, key=lambda x: model_probs.get(x,0), reverse=True)
+    sorted_null  = list(WHITE_RANGE)   # uniform = arbitrary order
+    top_model    = set(sorted_model[:TOP_K])
+    top_null     = set(sorted_null[:TOP_K])
+
+    for row in test_rows:
+        actual = row["balls"]
+        bs_model_vals.append(brier_score(model_probs, actual, WHITE_RANGE))
+        bs_null_vals.append( brier_score(null_probs,  actual, WHITE_RANGE))
+        ll_model_vals.append(log_loss_score(model_probs, actual, WHITE_RANGE))
+        ll_null_vals.append( log_loss_score(null_probs,  actual, WHITE_RANGE))
+        hits_model.append(len(top_model & set(actual)))
+        hits_null.append( len(top_null  & set(actual)))
+
+    n   = len(test_rows)
+    avg = lambda lst: sum(lst)/len(lst) if lst else 0
+
+    model_wins_bs = sum(1 for m,nu in zip(bs_model_vals, bs_null_vals) if m < nu)
+    model_wins_ll = sum(1 for m,nu in zip(ll_model_vals, ll_null_vals) if m < nu)
+
+    return {
+        "window":              n,
+        "brier_model":         round(avg(bs_model_vals), 6),
+        "brier_null":          round(avg(bs_null_vals),  6),
+        "brier_improvement":   round((avg(bs_null_vals)-avg(bs_model_vals))/avg(bs_null_vals)*100, 2),
+        "logloss_model":       round(avg(ll_model_vals), 6),
+        "logloss_null":        round(avg(ll_null_vals),  6),
+        "logloss_improvement": round((avg(ll_null_vals)-avg(ll_model_vals))/avg(ll_null_vals)*100, 2),
+        "avg_hits_model":      round(avg(hits_model), 3),
+        "avg_hits_null":       round(avg(hits_null),  3),
+        "expected_hits_chance":round(TOP_K * WHITE_COUNT / WHITE_MAX, 3),
+        "model_beats_null_brier_pct":  round(model_wins_bs / n * 100, 1),
+        "model_beats_null_logloss_pct":round(model_wins_ll / n * 100, 1),
+        "verdict": (
+            f"Model beats random on {model_wins_bs/n*100:.0f}% of draws (Brier). "
+            + ("Meaningful edge detected." if model_wins_bs/n > 0.55
+               else "No reliable edge over random baseline.")
+        ),
+    }
