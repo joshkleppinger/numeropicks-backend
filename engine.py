@@ -92,7 +92,7 @@ GAMES = {
         "white_count":   3,
         "special_name":  None,
         "draw_days":     {0,1,2,3,4,5,6},  # daily (twice daily actually)
-        "url_base":      "https://www.lottery.net/california/daily-3-evening/numbers",
+        "url_base":      "https://www.lotteryextreme.com/california/daily3-results",
         "csv":           DATA_DIR / "Daily3_draws.csv",
         "pred_csv":      DATA_DIR / "Daily3_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily3_accuracy.csv",
@@ -107,7 +107,7 @@ GAMES = {
         "white_count":   4,
         "special_name":  None,
         "draw_days":     {0,1,2,3,4,5,6},  # daily
-        "url_base":      "https://www.lottery.net/california/daily-4/numbers",
+        "url_base":      "https://www.lotteryextreme.com/california/daily4-results",
         "csv":           DATA_DIR / "Daily4_draws.csv",
         "pred_csv":      DATA_DIR / "Daily4_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily4_accuracy.csv",
@@ -188,6 +188,48 @@ def _parse_lottery_net_page(html: str, white_max: int, special_max: int,
                              white_count: int) -> list:
     soup    = BeautifulSoup(html, "html.parser")
     results = []
+    
+    # Check if this is lotteryextreme.com (Daily 3/4)
+    if "lotteryextreme.com" in html:
+        # Parse lotteryextreme.com format
+        for row in soup.find_all("tr"):
+            try:
+                cells = row.find_all("td")
+                if len(cells) < 2:
+                    continue
+                
+                # Date is in first cell, numbers in second
+                date_text = cells[0].get_text(strip=True)
+                nums_text = cells[1].get_text(strip=True)
+                
+                # Extract date - format: "Fri, May 1 (05/01/2026)"
+                if "(" not in date_text:
+                    continue
+                date_part = date_text.split("(")[1].split(")")[0]  # "05/01/2026"
+                month, day, year = date_part.split("/")
+                dt = datetime(int(year), int(month), int(day))
+                
+                # Extract digits - they're separated by "*"
+                nums = [int(n.strip()) for n in nums_text.split("*") if n.strip().isdigit()]
+                
+                if len(nums) != white_count:
+                    continue
+                
+                # Daily 3/4: order matters, no sorting, all 0-9
+                if not all(0 <= n <= 9 for n in nums):
+                    continue
+                
+                results.append({
+                    "date_str": dt.strftime("%a, %b %d, %Y"),
+                    "dt":       dt,
+                    "balls":    nums,  # Keep order for Daily 3/4
+                    "special":  None,
+                })
+            except Exception:
+                continue
+        return results
+    
+    # Original lottery.net parser for big lottery games
     for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 2:
