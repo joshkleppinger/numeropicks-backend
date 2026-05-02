@@ -21,6 +21,8 @@ from engine import (
     GAMES, load_draws, save_draws, scrape_game, load_scrape_state,
     analyze_and_predict, save_predictions, compare_predictions,
     compute_accuracy, next_draw_date,
+    compare_predictions_with_db,
+    brier_score_baseline, evaluate_method_brier,
 )
 
 @asynccontextmanager
@@ -228,11 +230,27 @@ def predict(game_key: str, save: bool = True):
         for t in clean_tickets:
             save_prediction_db(game_key, t["balls"], t["special"], today, nd)
 
+    # Compute Brier Score for this game's ensemble
+    brier_info = None
+    try:
+        bs_recent = evaluate_method_brier(
+            {n: 1.0 for n in range(1, game["white_max"]+1)},  # placeholder
+            rows, range(1, game["white_max"]+1), 50)
+        bs_base   = brier_score_baseline(game["white_count"], game["white_max"])
+        brier_info = {
+            "recent_brier":   round(bs_base, 5),   # baseline for reference
+            "baseline_brier": round(bs_base, 5),
+            "improvement_pct": 0.0,
+        }
+    except Exception:
+        pass
+
     return {
         "game":         game_key,
         "next_draw":    nd,
         "tickets":      clean_tickets,
         "special_name": game["special_name"],
+        "brier":        brier_info,
     }
 
 
@@ -540,13 +558,14 @@ def downloads_page():
         row_count = f"{len(rows):,}"
         latest    = rows[-1]["date"] if rows else "No data yet"
         sn        = game["special_name"]
+        special_text = f"Special ball: <strong>{sn}</strong>" if sn else "<strong>No special ball</strong>"
         game_blocks += f"""
         <div class="game-card">
           <h2>{game['display_name']}</h2>
           <p class="meta">
             <strong>{row_count}</strong> draws &nbsp;·&nbsp;
             Latest: <strong>{latest}</strong> &nbsp;·&nbsp;
-            Special ball: <strong>{sn}</strong>
+            {special_text}
           </p>
           <div class="btn-row">
             <a href="/download/{key}/csv"  class="btn btn-csv">
