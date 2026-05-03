@@ -191,42 +191,65 @@ def _parse_lottery_net_page(html: str, white_max: int, special_max: int,
     
     # Check if this is lotteryextreme.com (Daily 3/4)
     if "lotteryextreme.com" in html:
-        # Parse lotteryextreme.com format
-        for row in soup.find_all("tr"):
-            try:
-                cells = row.find_all("td")
-                if len(cells) < 2:
+        # Parse lotteryextreme.com format - numbers in <ul class='displayball'> with <li> elements
+        for table in soup.find_all("table", class_="results3"):
+            rows = table.find_all("tr")
+            i = 0
+            while i < len(rows):
+                try:
+                    # Date row has class 'cy' with date in format "Sat, May 2  (05/02/2026)"
+                    date_row = rows[i]
+                    if not date_row.get("class") or "cy" not in date_row.get("class"):
+                        i += 1
+                        continue
+                    
+                    date_text = date_row.get_text()
+                    # Extract date from format "Sat, May 2  (05/02/2026) - #21018"
+                    if "(" not in date_text or ")" not in date_text:
+                        i += 1
+                        continue
+                    
+                    date_part = date_text.split("(")[1].split(")")[0]  # "05/02/2026"
+                    month, day, year = date_part.split("/")
+                    dt = datetime(int(year), int(month), int(day))
+                    
+                    # Next row has class 'c1' with <ul class='displayball'> containing <li> digits
+                    if i + 1 >= len(rows):
+                        i += 1
+                        continue
+                    
+                    nums_row = rows[i + 1]
+                    ul = nums_row.find("ul", class_="displayball")
+                    if not ul:
+                        i += 2
+                        continue
+                    
+                    # Extract digits from <li> tags
+                    nums = []
+                    for li in ul.find_all("li"):
+                        txt = li.get_text(strip=True)
+                        if txt.isdigit():
+                            nums.append(int(txt))
+                    
+                    if len(nums) != white_count:
+                        i += 2
+                        continue
+                    
+                    # Validate range 0-9 for Daily 3/4
+                    if not all(0 <= n <= 9 for n in nums):
+                        i += 2
+                        continue
+                    
+                    results.append({
+                        "date_str": dt.strftime("%a, %b %d, %Y"),
+                        "dt":       dt,
+                        "balls":    nums,  # Keep order for Daily 3/4
+                        "special":  None,
+                    })
+                    i += 2  # Skip to next date row
+                except Exception:
+                    i += 1
                     continue
-                
-                # Date is in first cell, numbers in second
-                date_text = cells[0].get_text(strip=True)
-                nums_text = cells[1].get_text(strip=True)
-                
-                # Extract date - format: "Fri, May 1 (05/01/2026)"
-                if "(" not in date_text:
-                    continue
-                date_part = date_text.split("(")[1].split(")")[0]  # "05/01/2026"
-                month, day, year = date_part.split("/")
-                dt = datetime(int(year), int(month), int(day))
-                
-                # Extract digits - they're separated by "*"
-                nums = [int(n.strip()) for n in nums_text.split("*") if n.strip().isdigit()]
-                
-                if len(nums) != white_count:
-                    continue
-                
-                # Daily 3/4: order matters, no sorting, all 0-9
-                if not all(0 <= n <= 9 for n in nums):
-                    continue
-                
-                results.append({
-                    "date_str": dt.strftime("%a, %b %d, %Y"),
-                    "dt":       dt,
-                    "balls":    nums,  # Keep order for Daily 3/4
-                    "special":  None,
-                })
-            except Exception:
-                continue
         return results
     
     # Original lottery.net parser for big lottery games
