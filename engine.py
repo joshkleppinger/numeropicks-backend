@@ -92,7 +92,7 @@ GAMES = {
         "white_count":   3,
         "special_name":  None,
         "draw_days":     {0,1,2,3,4,5,6},  # daily (twice daily actually)
-        "url_base":      "https://www.lotteryextreme.com/california/daily3-results",
+        "url_base":      "https://www.lottery.net/california/daily-3-evening/numbers",
         "csv":           DATA_DIR / "Daily3_draws.csv",
         "pred_csv":      DATA_DIR / "Daily3_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily3_accuracy.csv",
@@ -107,7 +107,7 @@ GAMES = {
         "white_count":   4,
         "special_name":  None,
         "draw_days":     {0,1,2,3,4,5,6},  # daily
-        "url_base":      "https://www.lotteryextreme.com/california/daily4-results",
+        "url_base":      "https://www.lottery.net/california/daily-4/numbers",
         "csv":           DATA_DIR / "Daily4_draws.csv",
         "pred_csv":      DATA_DIR / "Daily4_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily4_accuracy.csv",
