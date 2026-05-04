@@ -91,8 +91,9 @@ GAMES = {
         "special_max":   0,      # no special ball
         "white_count":   3,
         "special_name":  None,
-        "draw_days":     {0,1,2,3,4,5,6},  # daily (twice daily actually)
+        "draw_days":     {0,1,2,3,4,5,6},  # daily (twice daily - midday + evening)
         "url_base":      "https://www.lottery.net/california/daily-3-evening/numbers",
+        "url_midday":    "https://www.lottery.net/california/daily-3-midday/numbers",
         "csv":           DATA_DIR / "Daily3_draws.csv",
         "pred_csv":      DATA_DIR / "Daily3_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily3_accuracy.csv",
@@ -344,19 +345,31 @@ def scrape_game(game: dict, existing_rows: list, log_fn=None) -> tuple:
         years_to_fetch = [current_year]
 
     all_parsed = []
-    for year in years_to_fetch:
-        url = f"{game['url_base']}/{year}"
-        log(f"Fetching {url} …")
+    
+    # For Daily 3, scrape BOTH Evening and Midday
+    urls_to_scrape = []
+    if game.get("url_midday"):
+        # Daily 3: scrape both draws
+        for year in years_to_fetch:
+            urls_to_scrape.append((f"{game['url_base']}/{year}", f"Evening {year}"))
+            urls_to_scrape.append((f"{game['url_midday']}/{year}", f"Midday {year}"))
+    else:
+        # Other games: single URL per year
+        for year in years_to_fetch:
+            urls_to_scrape.append((f"{game['url_base']}/{year}", str(year)))
+    
+    for url, label in urls_to_scrape:
+        log(f"Fetching {label} ({url}) …")
         try:
             resp   = requests.get(url, timeout=25, headers=_HEADERS)
             resp.raise_for_status()
             parsed = _parse_lottery_net_page(
                 resp.text, game["white_max"], game["special_max"], game["white_count"]
             )
-            log(f"  {len(parsed)} draws on {year} page")
+            log(f"  {len(parsed)} draws on {label} page")
             all_parsed.extend(parsed)
         except Exception as e:
-            log(f"  Error fetching {year}: {e}")
+            log(f"  Error fetching {label}: {e}")
 
     new_rows = []
     seen     = set()
