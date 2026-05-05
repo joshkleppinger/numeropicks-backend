@@ -1,3 +1,22 @@
+"""
+STABLE ENGINE INTERFACE CONTRACT
+--------------------------------
+This file defines a STRICT, STABLE interface between your API (main.py)
+and the prediction/scraping engine.
+
+DO NOT change function names or signatures below unless you also update main.py.
+
+REQUIRED PUBLIC FUNCTIONS:
+- GAMES (dict)
+- load_draws(filepath)
+- save_draws(filepath, rows)
+- scrape_game(game_key, year)
+- analyze_and_predict(rows, game)
+- full_backtest(rows, game)
+
+Everything else is internal and safe to modify.
+"""
+
 import math
 import random
 import csv
@@ -7,9 +26,9 @@ from bs4 import BeautifulSoup
 from collections import Counter
 from datetime import datetime
 
-# ─────────────────────────────────────────────
-# GAME DEFINITIONS
-# ─────────────────────────────────────────────
+# ============================================================
+# GAME DEFINITIONS (API DEPENDS ON THIS)
+# ============================================================
 
 GAMES = {
     "daily3_evening": {
@@ -35,88 +54,26 @@ GAMES = {
     }
 }
 
-# ─────────────────────────────────────────────
-# DATE PARSER
-# ─────────────────────────────────────────────
+# ============================================================
+# UTILITIES (INTERNAL)
+# ============================================================
 
-def parse_date(text):
-    try:
-        return datetime.strptime(text.strip(), "%a, %b %d, %Y")
-    except:
+def _parse_date(text):
+    for fmt in ("%a, %b %d, %Y", "%b %d, %Y"):
         try:
-            return datetime.strptime(text.strip(), "%b %d, %Y")
+            return datetime.strptime(text.strip(), fmt)
         except:
-            return None
-
-# ─────────────────────────────────────────────
-# SCRAPER (FIXED)
-# ─────────────────────────────────────────────
-
-def scrape_lottery_net(url, game):
-    print(f"Fetching {url} ...")
-
-    res = requests.get(url, timeout=10)
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    results = []
-
-    for row in soup.select("table tbody tr"):
-        try:
-            cols = row.find_all("td")
-            if len(cols) < 2:
-                continue
-
-            # Parse date
-            date_text = cols[0].get_text(strip=True)
-            dt = parse_date(date_text)
-            if not dt:
-                continue
-
-            # Extract numbers (robust)
-            nums = []
-
-            # Try <li>
-            for li in cols[-1].find_all("li"):
-                txt = li.get_text(strip=True)
-                if txt.isdigit():
-                    nums.append(int(txt))
-
-            # Fallback: spans/divs
-            if not nums:
-                for el in cols[-1].find_all(["span", "div"]):
-                    txt = el.get_text(strip=True)
-                    if txt.isdigit():
-                        nums.append(int(txt))
-
-            # Final fallback: raw text split
-            if not nums:
-                raw = cols[-1].get_text(" ", strip=True)
-                for part in raw.split():
-                    if part.isdigit():
-                        nums.append(int(part))
-
-            if len(nums) != game["white_count"]:
-                continue
-
-            if not all(0 <= n <= game["white_max"] for n in nums):
-                continue
-
-            results.append({
-                "date_str": dt.strftime("%a, %b %d, %Y"),
-                "dt": dt,
-                "balls": nums,
-                "special": None
-            })
-
-        except Exception:
             continue
+    return None
 
-    print(f"  -> Parsed {len(results)} draws")
-    return results
 
-# ─────────────────────────────────────────────
-# DATA IO
-# ─────────────────────────────────────────────
+def _normalize(d):
+    s = sum(d.values()) + 1e-12
+    return {k: v / s for k, v in d.items()}
+
+# ============================================================
+# DATA IO (STABLE)
+# ============================================================
 
 def load_draws(filepath):
     if not os.path.exists(filepath):
@@ -145,141 +102,144 @@ def save_draws(filepath, rows):
         for i, r in enumerate(rows):
             writer.writerow([i] + r["balls"])
 
-# ─────────────────────────────────────────────
-# UTILITIES
-# ─────────────────────────────────────────────
+# ============================================================
+# SCRAPER (INTERNAL CORE)
+# ============================================================
 
-def normalize(d):
-    s = sum(d.values()) + 1e-12
-    return {k: v / s for k, v in d.items()}
+def _scrape_lottery_net(url, game):
+    res = requests.get(url, timeout=10)
+    soup = BeautifulSoup(res.text, "html.parser")
 
-# ─────────────────────────────────────────────
-# MODELS
-# ─────────────────────────────────────────────
+    results = []
 
-def bayesian_frequency(rows, number_range):
-    counts = Counter()
+    for row in soup.select("table tbody tr"):
+        try:
+            cols = row.find_all("td")
+            if len(cols) < 2:
+                continue
+
+            dt = _parse_date(cols[0].get_text(strip=True))
+            if not dt:
+                continue
+
+            nums = []
+
+            for li in cols[-1].find_all("li"):
+                if li.text.strip().isdigit():
+                    nums.append(int(li.text.strip()))
+
+            if not nums:
+                for el in cols[-1].find_all(["span", "div"]):
+                    txt = el.text.strip()
+                    if txt.isdigit():
+                        nums.append(int(txt))
+
+            if not nums:
+                raw = cols[-1].get_text(" ", strip=True)
+                nums = [int(x) for x in raw.split() if x.isdigit()]
+
+            if len(nums) != game["white_count"]:
+                continue
+
+            results.append({
+                "date_str": dt.strftime("%a, %b %d, %Y"),
+                "dt": dt,
+                "balls": nums,
+                "special": None
+            })
+
+        except:
+            continue
+
+    return results
+
+# ============================================================
+# PUBLIC SCRAPER (STABLE API FUNCTION)
+# ============================================================
+
+def scrape_game(game_key, year):
+    if game_key not in GAMES:
+        raise ValueError(f"Unknown game: {game_key}")
+
+    if game_key == "daily3_evening":
+        url = f"https://www.lottery.net/california/daily-3-evening/numbers/{year}"
+    elif game_key == "daily3_midday":
+        url = f"https://www.lottery.net/california/daily-3-midday/numbers/{year}"
+    elif game_key == "daily4":
+        url = f"https://www.lottery.net/california/daily-4/numbers/{year}"
+    else:
+        raise ValueError("Unsupported game")
+
+    rows = _scrape_lottery_net(url, GAMES[game_key])
+    rows.sort(key=lambda x: x["dt"])
+    return rows
+
+# ============================================================
+# MODELS (INTERNAL)
+# ============================================================
+
+def _bayesian(rows, rng):
+    c = Counter()
     for r in rows:
-        counts.update(r["balls"])
-    return normalize({n: counts[n] + 1 for n in number_range})
+        c.update(r["balls"])
+    return _normalize({n: c[n] + 1 for n in rng})
 
 
-def gap_analysis(rows, number_range):
-    last_seen = {n: -1 for n in number_range}
+def _gap(rows, rng):
+    last = {n: -1 for n in rng}
     for i, r in enumerate(rows):
         for b in r["balls"]:
-            last_seen[b] = i
-    gaps = {n: len(rows) - last_seen[n] for n in number_range}
-    return normalize(gaps)
+            last[b] = i
+    return _normalize({n: len(rows) - last[n] for n in rng})
 
 
-def decay_model(rows, number_range, decay=0.98):
-    weights = Counter()
-    w = 1.0
+def _decay(rows, rng, d=0.98):
+    w = Counter()
+    weight = 1
     for r in reversed(rows):
         for b in r["balls"]:
-            weights[b] += w
-        w *= decay
-    return normalize(weights)
+            w[b] += weight
+        weight *= d
+    return _normalize(w)
 
-
-def random_model(number_range):
-    return {n: 1 / len(number_range) for n in number_range}
-
-# ─────────────────────────────────────────────
-# MONTE CARLO (SMOOTHING)
-# ─────────────────────────────────────────────
-
-def monte_carlo_smoothing(probs, number_range, k, n_sim=20000):
-    counts = Counter()
-    numbers = list(number_range)
-    weights = [probs[n] for n in numbers]
-
-    for _ in range(n_sim):
-        picks = random.choices(numbers, weights=weights, k=k)
-        counts.update(picks)
-
-    return normalize(counts)
-
-# ─────────────────────────────────────────────
-# ENGINE
-# ─────────────────────────────────────────────
+# ============================================================
+# PREDICTION (STABLE API FUNCTION)
+# ============================================================
 
 def analyze_and_predict(rows, game):
-    number_range = list(range(0, game["white_max"] + 1))
+    rng = list(range(0, game["white_max"] + 1))
 
-    m1 = bayesian_frequency(rows, number_range)
-    m2 = gap_analysis(rows, number_range)
-    m3 = decay_model(rows, number_range)
-
-    blended = {
-        n: 0.4 * m1[n] + 0.3 * m2[n] + 0.3 * m3[n]
-        for n in number_range
-    }
-
-    probs = monte_carlo_smoothing(
-        blended,
-        number_range,
-        game["white_count"]
-    )
-
-    return probs
-
-# ─────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────
-
-def brier_score(probs, actual, number_range):
-    actual_set = set(actual)
-    return sum(
-        (probs.get(n, 0) - (1 if n in actual_set else 0)) ** 2
-        for n in number_range
-    )
-
-
-def calibration_error(probs, rows, number_range):
-    error = 0
-    count = 0
-
-    for n in number_range:
-        p = probs.get(n, 0)
-        actual_freq = sum(1 for r in rows if n in r["balls"]) / len(rows)
-        error += abs(p - actual_freq)
-        count += 1
-
-    return error / (count + 1e-12)
-
-# ─────────────────────────────────────────────
-# BACKTEST
-# ─────────────────────────────────────────────
-
-def full_backtest(rows, game, train_size=200, windows=20):
-    number_range = list(range(0, game["white_max"] + 1))
-
-    brier_model = []
-    brier_null = []
-    calib = []
-
-    for i in range(min(windows, len(rows) - train_size - 1)):
-        train = rows[i:i + train_size]
-        test = rows[i + train_size]
-
-        probs = analyze_and_predict(train, game)
-        null = random_model(number_range)
-
-        brier_model.append(
-            brier_score(probs, test["balls"], number_range)
-        )
-        brier_null.append(
-            brier_score(null, test["balls"], number_range)
-        )
-
-        calib.append(
-            calibration_error(probs, train, number_range)
-        )
+    m1 = _bayesian(rows, rng)
+    m2 = _gap(rows, rng)
+    m3 = _decay(rows, rng)
 
     return {
-        "avg_model_brier": sum(brier_model) / len(brier_model),
-        "avg_null_brier": sum(brier_null) / len(brier_null),
-        "calibration_error": sum(calib) / len(calib)
+        n: 0.4*m1[n] + 0.3*m2[n] + 0.3*m3[n]
+        for n in rng
+    }
+
+# ============================================================
+# BACKTEST (STABLE API FUNCTION)
+# ============================================================
+
+def full_backtest(rows, game, train_size=200):
+    rng = list(range(0, game["white_max"] + 1))
+
+    scores = []
+
+    for i in range(len(rows) - train_size - 1):
+        train = rows[i:i+train_size]
+        test = rows[i+train_size]
+
+        probs = analyze_and_predict(train, game)
+
+        score = sum(
+            (probs.get(n, 0) - (1 if n in test["balls"] else 0))**2
+            for n in rng
+        )
+
+        scores.append(score)
+
+    return {
+        "avg_brier": sum(scores)/len(scores) if scores else None
     }
