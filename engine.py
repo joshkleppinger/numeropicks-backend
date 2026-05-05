@@ -825,10 +825,15 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
     alpha   = 2.0
     w_freq  = {n: (w_count.get(n, 0) + alpha) / (ERA3_DRAWS * WHITE_COUNT + alpha * WHITE_MAX)
                for n in WHITE_RANGE}
-    s_freq  = {n: (s_count.get(n, 0) + alpha) / (ERA3_DRAWS + alpha * SPECIAL_MAX)
-               for n in SPEC_RANGE}
     w_freq  = soft_floor(w_freq, 0.30)
-    s_freq  = soft_floor(s_freq, 0.50)
+    
+    # Only analyze special ball if game has one
+    if SPECIAL_MAX > 0:
+        s_freq  = {n: (s_count.get(n, 0) + alpha) / (ERA3_DRAWS + alpha * SPECIAL_MAX)
+                   for n in SPEC_RANGE}
+        s_freq  = soft_floor(s_freq, 0.50)
+    else:
+        s_freq  = {}  # No special ball for Daily 3/4
 
     prog(18, "Method 2 — Markov …")
     m2 = {n: 0.0 for n in WHITE_RANGE}
@@ -846,7 +851,7 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
 
     prog(28, "Method 3 — Spectral …")
     m3_w = {n: 1.0 for n in WHITE_RANGE}
-    m3_s = {n: 1.0 for n in SPEC_RANGE}
+    m3_s = {}
     if HAS_NP and ERA3_DRAWS > 20:
         for pos in range(WHITE_COUNT):
             col = era3_balls[:, pos].astype(float)
@@ -854,68 +859,97 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
             tgt = max(1, min(WHITE_MAX, mu + 0.2 * (mu - col[-1])))
             for n in WHITE_RANGE:
                 m3_w[n] *= math.exp(-0.5 * ((n - tgt) / (sig * 4.0)) ** 2)
-        s_arr = era3_special.astype(float)
-        s_tgt = max(1, min(SPECIAL_MAX, s_arr.mean() + 0.2 * (s_arr.mean() - s_arr[-1])))
-        s_sig = s_arr.std() * 4.0 + 1e-6
-        for n in SPEC_RANGE:
-            m3_s[n] *= math.exp(-0.5 * ((n - s_tgt) / s_sig) ** 2)
+        if SPECIAL_MAX > 0:
+            m3_s = {n: 1.0 for n in SPEC_RANGE}
+            s_arr = era3_special.astype(float)
+            s_tgt = max(1, min(SPECIAL_MAX, s_arr.mean() + 0.2 * (s_arr.mean() - s_arr[-1])))
+            s_sig = s_arr.std() * 4.0 + 1e-6
+            for n in SPEC_RANGE:
+                m3_s[n] *= math.exp(-0.5 * ((n - s_tgt) / s_sig) ** 2)
     m3_w = soft_floor(m3_w, 0.40)
-    m3_s = soft_floor(m3_s, 0.60)
+    if SPECIAL_MAX > 0:
+        m3_s = soft_floor(m3_s, 0.60)
 
     prog(38, "Method 4 — Gap …")
     last_w = {}; last_s = {}
     for i, r in enumerate(rows):
         for b in r["balls"]: last_w[b] = i
-        last_s[r["special"]] = i
+        if SPECIAL_MAX > 0 and r["special"] is not None:
+            last_s[r["special"]] = i
     eg_w = WHITE_MAX / float(WHITE_COUNT)
-    eg_s = float(SPECIAL_MAX)
     m4_w = {n: (lambda g: g if g >= 1 else g ** 2)(
                 (N - last_w.get(n, N - int(eg_w))) / eg_w) for n in WHITE_RANGE}
-    m4_s = {n: (lambda g: g if g >= 1 else g ** 2)(
-                (N - last_s.get(n, N - int(eg_s))) / eg_s) for n in SPEC_RANGE}
     m4_w = soft_floor(m4_w, 0.20)
-    m4_s = soft_floor(m4_s, 0.20)
+    
+    if SPECIAL_MAX > 0:
+        eg_s = float(SPECIAL_MAX)
+        m4_s = {n: (lambda g: g if g >= 1 else g ** 2)(
+                    (N - last_s.get(n, N - int(eg_s))) / eg_s) for n in SPEC_RANGE}
+        m4_s = soft_floor(m4_s, 0.20)
+    else:
+        m4_s = {}
 
     prog(50, "Method 5 — Neural …")
     m5_w = {n: 1.0 for n in WHITE_RANGE}
-    m5_s = {n: 1.0 for n in SPEC_RANGE}
+    m5_s = {}
     if HAS_TORCH and ERA3_DRAWS > 50 and HAS_NP:
         try:
-            m5_w, m5_s = _torch_predict(era3_balls, era3_special, ERA3_DRAWS,
-                                         WHITE_MAX, SPECIAL_MAX)
-            m5_w = soft_floor(m5_w, 0.20)
-            m5_s = soft_floor(m5_s, 0.20)
+            if SPECIAL_MAX > 0:
+                m5_w, m5_s = _torch_predict(era3_balls, era3_special, ERA3_DRAWS,
+                                             WHITE_MAX, SPECIAL_MAX)
+                m5_w = soft_floor(m5_w, 0.20)
+                m5_s = soft_floor(m5_s, 0.20)
+            else:
+                # Daily 3/4: predict white balls only
+                m5_w, _ = _torch_predict(era3_balls, None, ERA3_DRAWS,
+                                         WHITE_MAX, 0)
+                m5_w = soft_floor(m5_w, 0.20)
         except Exception:
             pass
     if all(v == 1.0 for v in m5_w.values()) and HAS_SK and HAS_NP and ERA3_DRAWS > 50:
         try:
-            m5_w, m5_s = _sklearn_predict(era3_balls, era3_special, ERA3_DRAWS,
-                                           WHITE_MAX, SPECIAL_MAX)
-            m5_w = soft_floor(m5_w, 0.20)
-            m5_s = soft_floor(m5_s, 0.20)
+            if SPECIAL_MAX > 0:
+                m5_w, m5_s = _sklearn_predict(era3_balls, era3_special, ERA3_DRAWS,
+                                               WHITE_MAX, SPECIAL_MAX)
+                m5_w = soft_floor(m5_w, 0.20)
+                m5_s = soft_floor(m5_s, 0.20)
+            else:
+                # Daily 3/4: predict white balls only
+                m5_w, _ = _sklearn_predict(era3_balls, None, ERA3_DRAWS,
+                                           WHITE_MAX, 0)
+                m5_w = soft_floor(m5_w, 0.20)
         except Exception:
             pass
 
     prog(62, "Method 6 — Monte Carlo …")
     combo_w = arith_blend([w_freq, m2, m3_w, m4_w, m5_w],
                           [0.20, 0.15, 0.10, 0.20, 0.35], WHITE_RANGE)
-    combo_s = arith_blend([s_freq, m3_s, m4_s, m5_s],
-                          [0.25, 0.15, 0.25, 0.35], SPEC_RANGE)
+    
+    if SPECIAL_MAX > 0:
+        combo_s = arith_blend([s_freq, m3_s, m4_s, m5_s],
+                              [0.25, 0.15, 0.25, 0.35], SPEC_RANGE)
+    else:
+        combo_s = {}
+    
     tw = sum(combo_w.values()) + 1e-12
-    ts = sum(combo_s.values()) + 1e-12
     w_probs = {n: combo_w[n] / tw for n in WHITE_RANGE}
-    s_probs = {n: combo_s[n] / ts for n in SPEC_RANGE}
     m6_w  = {n: 1e-9 for n in WHITE_RANGE}
-    m6_s  = {n: 1e-9 for n in SPEC_RANGE}
     SAMPLES = 120_000
     hal_w   = _halton_sequence(SAMPLES, 2)
-    hal_s   = _halton_sequence(SAMPLES, 3)
     w_cdf   = _make_cdf(w_probs, WHITE_RANGE)
-    s_cdf   = _make_cdf(s_probs, SPEC_RANGE)
     for i in range(SAMPLES): m6_w[_sample_cdf(w_cdf, hal_w[i])] += 1
-    for i in range(SAMPLES): m6_s[_sample_cdf(s_cdf, hal_s[i])] += 1
     m6_w = soft_floor(m6_w, 0.15)
-    m6_s = soft_floor(m6_s, 0.15)
+    
+    if SPECIAL_MAX > 0:
+        ts = sum(combo_s.values()) + 1e-12
+        s_probs = {n: combo_s[n] / ts for n in SPEC_RANGE}
+        m6_s  = {n: 1e-9 for n in SPEC_RANGE}
+        hal_s   = _halton_sequence(SAMPLES, 3)
+        s_cdf   = _make_cdf(s_probs, SPEC_RANGE)
+        for i in range(SAMPLES): m6_s[_sample_cdf(s_cdf, hal_s[i])] += 1
+        m6_s = soft_floor(m6_s, 0.15)
+    else:
+        m6_s = {}
 
     prog(75, "Method 7 — Signature …")
     m7_w = {n: 1.0 for n in WHITE_RANGE}
@@ -948,8 +982,12 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
 
     final_w = arith_blend([w_freq, m2, m3_w, m4_w, m5_w, m6_w, m7_w],
                           w_weights, WHITE_RANGE)
-    final_s = arith_blend([s_freq, m3_s, m4_s, m5_s, m6_s],
-                          [0.20, 0.10, 0.25, 0.30, 0.15], SPEC_RANGE)
+    
+    if SPECIAL_MAX > 0:
+        final_s = arith_blend([s_freq, m3_s, m4_s, m5_s, m6_s],
+                              [0.20, 0.10, 0.25, 0.30, 0.15], SPEC_RANGE)
+    else:
+        final_s = {}
 
     # ── Compute and log overall Brier Score ───────────────────────────────────
     if HAS_NP and ERA3_DRAWS > 10:
@@ -970,7 +1008,7 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
     used_sets     = []
     bands_covered = set()
 
-    if HAS_NP:
+    if HAS_NP and SPECIAL_MAX > 0:
         s_wts = np.array([final_s[n] for n in SPEC_RANGE], dtype=float)
         s_wts /= s_wts.sum()
 
