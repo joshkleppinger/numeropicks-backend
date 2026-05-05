@@ -1,33 +1,32 @@
 """
-STABLE ENGINE INTERFACE CONTRACT
---------------------------------
-This file defines a STRICT, STABLE interface between your API (main.py)
-and the prediction/scraping engine.
+ENGINE.PY — FULL STABLE BUILD
 
-DO NOT change function names or signatures below unless you also update main.py.
+This version includes ALL functions required by main.py to prevent
+import errors and deployment failures.
 
-REQUIRED PUBLIC FUNCTIONS:
-- GAMES (dict)
-- load_draws(filepath)
-- save_draws(filepath, rows)
-- scrape_game(game_key, year)
-- analyze_and_predict(rows, game)
-- full_backtest(rows, game)
-
-Everything else is internal and safe to modify.
+STABLE PUBLIC INTERFACE (DO NOT CHANGE NAMES):
+- GAMES
+- load_draws
+- save_draws
+- scrape_game
+- load_scrape_state
+- save_scrape_state
+- analyze_and_predict
+- full_backtest
 """
 
+import os
+import csv
+import json
 import math
 import random
-import csv
-import os
 import requests
 from bs4 import BeautifulSoup
 from collections import Counter
 from datetime import datetime
 
 # ============================================================
-# GAME DEFINITIONS (API DEPENDS ON THIS)
+# GAME DEFINITIONS
 # ============================================================
 
 GAMES = {
@@ -55,7 +54,7 @@ GAMES = {
 }
 
 # ============================================================
-# UTILITIES (INTERNAL)
+# UTILITIES
 # ============================================================
 
 def _parse_date(text):
@@ -68,11 +67,11 @@ def _parse_date(text):
 
 
 def _normalize(d):
-    s = sum(d.values()) + 1e-12
-    return {k: v / s for k, v in d.items()}
+    total = sum(d.values()) + 1e-12
+    return {k: v / total for k, v in d.items()}
 
 # ============================================================
-# DATA IO (STABLE)
+# DATA IO
 # ============================================================
 
 def load_draws(filepath):
@@ -103,7 +102,28 @@ def save_draws(filepath, rows):
             writer.writerow([i] + r["balls"])
 
 # ============================================================
-# SCRAPER (INTERNAL CORE)
+# SCRAPE STATE
+# ============================================================
+
+def load_scrape_state(filepath="scrape_state.json"):
+    if not os.path.exists(filepath):
+        return {}
+    try:
+        with open(filepath, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def save_scrape_state(state, filepath="scrape_state.json"):
+    try:
+        with open(filepath, "w") as f:
+            json.dump(state, f)
+    except:
+        pass
+
+# ============================================================
+# SCRAPER CORE
 # ============================================================
 
 def _scrape_lottery_net(url, game):
@@ -124,16 +144,20 @@ def _scrape_lottery_net(url, game):
 
             nums = []
 
+            # Try list items first
             for li in cols[-1].find_all("li"):
-                if li.text.strip().isdigit():
-                    nums.append(int(li.text.strip()))
+                txt = li.text.strip()
+                if txt.isdigit():
+                    nums.append(int(txt))
 
+            # Fallback spans/divs
             if not nums:
                 for el in cols[-1].find_all(["span", "div"]):
                     txt = el.text.strip()
                     if txt.isdigit():
                         nums.append(int(txt))
 
+            # Final fallback: raw text
             if not nums:
                 raw = cols[-1].get_text(" ", strip=True)
                 nums = [int(x) for x in raw.split() if x.isdigit()]
@@ -154,7 +178,7 @@ def _scrape_lottery_net(url, game):
     return results
 
 # ============================================================
-# PUBLIC SCRAPER (STABLE API FUNCTION)
+# PUBLIC SCRAPER
 # ============================================================
 
 def scrape_game(game_key, year):
@@ -175,7 +199,7 @@ def scrape_game(game_key, year):
     return rows
 
 # ============================================================
-# MODELS (INTERNAL)
+# MODEL METHODS
 # ============================================================
 
 def _bayesian(rows, rng):
@@ -186,24 +210,24 @@ def _bayesian(rows, rng):
 
 
 def _gap(rows, rng):
-    last = {n: -1 for n in rng}
+    last_seen = {n: -1 for n in rng}
     for i, r in enumerate(rows):
         for b in r["balls"]:
-            last[b] = i
-    return _normalize({n: len(rows) - last[n] for n in rng})
+            last_seen[b] = i
+    return _normalize({n: len(rows) - last_seen[n] for n in rng})
 
 
-def _decay(rows, rng, d=0.98):
-    w = Counter()
-    weight = 1
+def _decay(rows, rng, decay=0.98):
+    weights = Counter()
+    w = 1.0
     for r in reversed(rows):
         for b in r["balls"]:
-            w[b] += weight
-        weight *= d
-    return _normalize(w)
+            weights[b] += w
+        w *= decay
+    return _normalize(weights)
 
 # ============================================================
-# PREDICTION (STABLE API FUNCTION)
+# PREDICTION
 # ============================================================
 
 def analyze_and_predict(rows, game):
@@ -219,12 +243,11 @@ def analyze_and_predict(rows, game):
     }
 
 # ============================================================
-# BACKTEST (STABLE API FUNCTION)
+# BACKTEST
 # ============================================================
 
 def full_backtest(rows, game, train_size=200):
     rng = list(range(0, game["white_max"] + 1))
-
     scores = []
 
     for i in range(len(rows) - train_size - 1):
@@ -233,13 +256,14 @@ def full_backtest(rows, game, train_size=200):
 
         probs = analyze_and_predict(train, game)
 
-        score = sum(
+        brier = sum(
             (probs.get(n, 0) - (1 if n in test["balls"] else 0))**2
             for n in rng
         )
 
-        scores.append(score)
+        scores.append(brier)
 
     return {
-        "avg_brier": sum(scores)/len(scores) if scores else None
+        "avg_brier": sum(scores)/len(scores) if scores else None,
+        "samples": len(scores)
     }
