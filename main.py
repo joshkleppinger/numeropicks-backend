@@ -220,7 +220,7 @@ def predict(game_key: str, save: bool = True):
     clean_tickets = [
         {
             "balls":   [int(b) for b in t["balls"]],
-            "special": int(t["special"]),
+            "special": int(t["special"]) if t.get("special") is not None else None,
         }
         for t in tickets
     ]
@@ -437,15 +437,24 @@ def download_csv(game_key: str):
 
     n          = game["white_count"]
     sn         = game["special_name"]
-    fieldnames = ["date"] + [f"ball_{i}" for i in range(1, n + 1)] + [sn.lower()]
+    fieldnames = ["date"] + [f"ball_{i}" for i in range(1, n + 1)]
+    if sn:
+        fieldnames.append(sn.lower())
+    # Add draw_type for Daily 3 (midday/evening)
+    if game.get("key") == "daily3":
+        fieldnames.append("draw_type")
 
     buf = io.StringIO()
     writer = csv_module.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
     for r in rows:
-        row = {"date": r["date"], sn.lower(): r["special"]}
+        row = {"date": r["date"]}
+        if sn:
+            row[sn.lower()] = r.get("special", "")
         for i, b in enumerate(r["balls"], 1):
             row[f"ball_{i}"] = b
+        if game.get("key") == "daily3":
+            row["draw_type"] = r.get("draw_type", "")
         writer.writerow(row)
 
     buf.seek(0)
@@ -500,7 +509,11 @@ def download_xlsx(game_key: str):
     )
 
     # ── Header row ────────────────────────────────────────────────────────────
-    headers = ["Date"] + [f"Ball {i}" for i in range(1, n + 1)] + [sn]
+    headers = ["Date"] + [f"Ball {i}" for i in range(1, n + 1)]
+    if sn:
+        headers.append(sn)
+    if game.get("key") == "daily3":
+        headers.append("Draw")
     for col, hdr in enumerate(headers, 1):
         cell           = ws.cell(row=1, column=col, value=hdr)
         cell.font      = header_font
@@ -523,16 +536,27 @@ def download_xlsx(game_key: str):
             c.border    = thin_border
             if fill: c.fill = fill
 
-        # Special ball (red)
-        c           = ws.cell(row=row_idx, column=n + 2, value=r["special"])
-        c.font      = special_font
-        c.fill      = special_fill
-        c.alignment = center
-        c.border    = thin_border
+        # Special ball (red) — only for games that have one
+        next_col = n + 2
+        if sn:
+            c           = ws.cell(row=row_idx, column=next_col, value=r.get("special"))
+            c.font      = special_font
+            c.fill      = special_fill
+            c.alignment = center
+            c.border    = thin_border
+            next_col   += 1
+
+        # Draw type (Daily 3 only)
+        if game.get("key") == "daily3":
+            c = ws.cell(row=row_idx, column=next_col, value=r.get("draw_type", ""))
+            c.alignment = center
+            c.border    = thin_border
+            if fill: c.fill = fill
 
     # ── Column widths ─────────────────────────────────────────────────────────
     ws.column_dimensions["A"].width = 22
-    for col in range(2, n + 3):
+    total_cols = len(headers)
+    for col in range(2, total_cols + 1):
         ws.column_dimensions[
             openpyxl.utils.get_column_letter(col)
         ].width = 9
