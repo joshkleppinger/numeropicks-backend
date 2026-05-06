@@ -44,7 +44,7 @@ def init_db():
                     prediction_date DATE        NOT NULL,
                     target_draw_date DATE       NOT NULL,
                     balls           JSONB       NOT NULL,
-                    special         INTEGER     NOT NULL,
+                    special         INTEGER,
                     created_at      TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
@@ -56,17 +56,26 @@ def init_db():
                     updated_at  TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
-            # Draw history cache table (so we don't re-scrape every restart)
+            # Draw history cache table
+            # special is nullable (Daily 3 / Daily 4 have no special ball)
+            # draw_type distinguishes Daily 3 Midday vs Evening on same date
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS draw_history (
                     id          SERIAL PRIMARY KEY,
                     game        VARCHAR(30)  NOT NULL,
                     draw_date   VARCHAR(40)  NOT NULL,
                     balls       JSONB        NOT NULL,
-                    special     INTEGER      NOT NULL,
-                    UNIQUE(game, draw_date)
+                    special     INTEGER,
+                    draw_type   VARCHAR(10),
+                    UNIQUE(game, draw_date, draw_type)
                 );
             """)
+            # Migrate existing table (safe to run repeatedly)
+            try:
+                cur.execute("ALTER TABLE draw_history ADD COLUMN IF NOT EXISTS draw_type VARCHAR(10)")
+                cur.execute("ALTER TABLE draw_history ALTER COLUMN special DROP NOT NULL")
+            except Exception:
+                pass
         print("[db] Tables ready ✔")
         return True
     except Exception as e:
@@ -92,7 +101,7 @@ def save_prediction_db(game: str, balls: list, special: int,
                 prediction_date,
                 target_date,
                 json.dumps(balls),
-                int(special),
+                int(special) if special is not None else None,
             ))
         return True
     except Exception as e:
@@ -120,7 +129,7 @@ def load_predictions_db(game: str) -> list:
                 "prediction_date":  str(pred_date),
                 "target_draw_date": str(tgt_date),
                 "pred_balls":       balls_json if isinstance(balls_json, list) else json.loads(balls_json),
-                "pred_special":     int(special),
+                "pred_special":     int(special) if special is not None else None,
             })
         return result
     except Exception as e:
@@ -173,20 +182,23 @@ def save_draws_db(game: str, rows: list) -> int:
         with conn.cursor() as cur:
             for r in rows:
                 try:
+                    special = int(r["special"]) if r.get("special") is not None else None
+                    draw_type = r.get("draw_type") or None  # None for non-Daily-3 games
                     cur.execute("""
-                        INSERT INTO draw_history (game, draw_date, balls, special)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (game, draw_date) DO NOTHING
+                        INSERT INTO draw_history (game, draw_date, balls, special, draw_type)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (game, draw_date, draw_type) DO NOTHING
                     """, (
                         game,
                         r["date"],
                         json.dumps([int(b) for b in r["balls"]]),
-                        int(r["special"]),
+                        special,
+                        draw_type,
                     ))
                     if cur.rowcount > 0:
                         added += 1
-                except Exception:
-                    pass
+                except Exception as row_err:
+                    print(f"[db] row save error: {row_err}")
         return added
     except Exception as e:
         print(f"[db] save_draws error: {e}")
@@ -201,20 +213,23 @@ def load_draws_db(game: str) -> list:
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT draw_date, balls, special
+                SELECT draw_date, balls, special, draw_type
                 FROM draw_history
                 WHERE game = %s
-                ORDER BY draw_date ASC
+                ORDER BY draw_date ASC, draw_type ASC
             """, (game,))
             rows = cur.fetchall()
         result = []
-        for draw_date, balls_json, special in rows:
+        for draw_date, balls_json, special, draw_type in rows:
             balls = balls_json if isinstance(balls_json, list) else json.loads(balls_json)
-            result.append({
+            row = {
                 "date":    draw_date,
                 "balls":   [int(b) for b in balls],
-                "special": int(special),
-            })
+                "special": int(special) if special is not None else None,
+            }
+            if draw_type:
+                row["draw_type"] = draw_type
+            result.append(row)
         return result
     except Exception as e:
         print(f"[db] load_draws error: {e}")
