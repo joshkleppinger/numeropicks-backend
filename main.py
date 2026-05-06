@@ -48,9 +48,11 @@ async def lifespan(app: FastAPI):
         if not force:
             time.sleep(1)
         total = sum(len(_draw_cache.get(k, [])) for k in GAMES)
+        # Check if any individual game has zero rows - force scrape if so
+        any_empty = any(len(_draw_cache.get(k, [])) == 0 for k in GAMES)
         # Check last scrape time from DB
         ls = load_scrape_state_db() or load_scrape_state()
-        needs_scrape = (total < 30) or force
+        needs_scrape = (total < 30) or force or any_empty
         if not needs_scrape and ls:
             hours_ago = (datetime.now() - ls).total_seconds() / 3600
             needs_scrape = hours_ago >= 12
