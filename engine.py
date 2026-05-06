@@ -1110,13 +1110,34 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
         })
 
     prog(100, "Done.")
-    # Daily 3/4: return single best prediction (not 5 diverse tickets)
+
+    # Daily 3/4: digits 0-9 WITH replacement allowed (e.g. 1-1-4 is valid)
+    # Band diversity check doesn't apply — generate 5 weighted tickets instead
     if game["white_count"] in [3, 4] and game["special_max"] == 0:
-        # Single best combination for Daily 3/4
-        sorted_nums = sorted(WHITE_RANGE, key=lambda n: final_w.get(n, 0), reverse=True)
-        best_combo = sorted_nums[:game["white_count"]]
-        return [{"balls": best_combo, "special": None}]
-    
+        daily_tickets = []
+        used_daily = []
+        # Normalise final_w into a probability array over 0-9
+        if HAS_NP:
+            wt_arr = np.array([final_w.get(n, 1.0) for n in WHITE_RANGE], dtype=float)
+            wt_arr /= wt_arr.sum()
+            d_attempt = 0
+            while len(daily_tickets) < 5 and d_attempt < 300:
+                d_attempt += 1
+                # Sample WITH replacement so repeated digits are possible
+                combo = sorted(int(n) for n in np.random.choice(
+                    list(WHITE_RANGE), size=WHITE_COUNT, replace=True, p=wt_arr))
+                if combo not in used_daily:
+                    used_daily.append(combo)
+                    daily_tickets.append({"balls": combo, "special": None})
+        else:
+            # Fallback: top-N with slight shuffle for variety
+            sorted_nums = sorted(WHITE_RANGE, key=lambda n: final_w.get(n, 0), reverse=True)
+            for i in range(5):
+                pool = sorted_nums[:max(WHITE_COUNT + i * 2, WHITE_COUNT)]
+                combo = sorted(random.choices(pool, k=WHITE_COUNT))
+                daily_tickets.append({"balls": combo, "special": None})
+        return daily_tickets
+
     return tickets
 
 
