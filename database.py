@@ -183,7 +183,8 @@ def save_draws_db(game: str, rows: list) -> int:
             for r in rows:
                 try:
                     special = int(r["special"]) if r.get("special") is not None else None
-                    draw_type = r.get("draw_type") or None  # None for non-Daily-3 games
+                    # Use empty string instead of NULL for draw_type so unique index works
+                    draw_type = r.get("draw_type") or ''
                     cur.execute("""
                         INSERT INTO draw_history (game, draw_date, balls, special, draw_type)
                         VALUES (%s, %s, %s, %s, %s)
