@@ -1099,14 +1099,14 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
             adj /= adj.sum()
             special = int(np.random.choice(list(SPEC_RANGE), p=adj))
         else:
-            special = random.randint(1, SPECIAL_MAX)
+            special = random.randint(1, SPECIAL_MAX) if SPECIAL_MAX > 0 else None
 
         tickets.append({"balls": sorted(chosen), "special": special})
 
     while len(tickets) < 5:
         tickets.append({
             "balls":   sorted(random.sample(list(WHITE_RANGE), WHITE_COUNT)),
-            "special": random.randint(1, SPECIAL_MAX),
+            "special": random.randint(1, SPECIAL_MAX) if SPECIAL_MAX > 0 else None,
         })
 
     prog(100, "Done.")
