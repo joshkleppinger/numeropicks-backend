@@ -1111,30 +1111,88 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
 
     prog(100, "Done.")
 
-    # Daily 3/4: digits 0-9 WITH replacement allowed (e.g. 1-1-4 is valid)
-    # Band diversity check doesn't apply — generate 5 weighted tickets instead
+    # ── Daily 3/4: position-aware straight prediction ────────────────────────
+    # Each position is scored independently so the ticket represents the most
+    # probable digit at each slot — this is the optimal "straight" play.
+    # Viewers can also use it as a "box" play (any order) if they prefer.
     if game["white_count"] in [3, 4] and game["special_max"] == 0:
-        daily_tickets = []
-        used_daily = []
-        # Normalise final_w into a probability array over 0-9
         if HAS_NP:
-            wt_arr = np.array([final_w.get(n, 1.0) for n in WHITE_RANGE], dtype=float)
-            wt_arr /= wt_arr.sum()
+            # Build per-position probability distributions from 4 sources:
+            #   1. Position frequency  — how often each digit appears at this slot
+            #   2. Markov transition   — what tends to follow the last digit at this slot
+            #   3. Spectral reversion  — pull toward positional mean
+            #   4. Decay signature     — recency-weighted positional counts
+            pos_probs = []  # pos_probs[pos] = np.array of shape (WHITE_MAX,) summing to 1
+            for pos in range(WHITE_COUNT):
+                col = era3_balls[:, pos].tolist()
+
+                # 1. Positional frequency with Laplace smoothing
+                cnt = Counter(col)
+                freq_p = np.array(
+                    [(cnt.get(n, 0) + 1.0) / (len(col) + WHITE_MAX) for n in WHITE_RANGE],
+                    dtype=float)
+
+                # 2. Markov: probability of each digit following the last seen at this pos
+                trans = defaultdict(Counter)
+                for i in range(len(col) - 1):
+                    trans[col[i]][col[i + 1]] += 1
+                last = col[-1]
+                total = sum(trans[last].values())
+                if total:
+                    markov_p = np.array(
+                        [(trans[last].get(n, 0) + 0.5) / (total + 0.5 * WHITE_MAX)
+                         for n in WHITE_RANGE], dtype=float)
+                else:
+                    markov_p = freq_p.copy()
+
+                # 3. Spectral: Gaussian centred on mean-reversion target
+                col_arr = np.array(col, dtype=float)
+                mu = col_arr.mean(); sig = col_arr.std() + 1e-6
+                tgt = max(WHITE_RANGE.start, min(WHITE_MAX - 1,
+                          mu + 0.2 * (mu - col_arr[-1])))
+                spec_p = np.array(
+                    [math.exp(-0.5 * ((n - tgt) / (sig * 3.0)) ** 2) for n in WHITE_RANGE],
+                    dtype=float)
+
+                # 4. Recency decay: weight recent draws more heavily
+                decay = 0.9997
+                decay_cnt = np.zeros(WHITE_MAX, dtype=float)
+                for idx, val in enumerate(col):
+                    w = decay ** (len(col) - 1 - idx)
+                    decay_cnt[val - WHITE_RANGE.start] += w
+                decay_p = decay_cnt + 1e-9
+
+                # Blend the four sources
+                blend = 0.30 * freq_p + 0.35 * markov_p + 0.20 * spec_p + 0.15 * decay_p
+                blend /= blend.sum()
+                pos_probs.append(blend)
+
+            # Generate 5 ordered tickets by sampling each position independently
+            digits = list(WHITE_RANGE)
+            daily_tickets = []
+            used_daily = []
             d_attempt = 0
-            while len(daily_tickets) < 5 and d_attempt < 300:
+            while len(daily_tickets) < 5 and d_attempt < 400:
                 d_attempt += 1
-                # Sample WITH replacement so repeated digits are possible
-                combo = sorted(int(n) for n in np.random.choice(
-                    list(WHITE_RANGE), size=WHITE_COUNT, replace=True, p=wt_arr))
+                # Sample each position independently (WITH replacement within a ticket
+                # is implicit — each position draws from the full 0-9 pool separately)
+                combo = [int(np.random.choice(digits, p=pos_probs[p]))
+                         for p in range(WHITE_COUNT)]
                 if combo not in used_daily:
                     used_daily.append(combo)
+                    # Store in draw order — do NOT sort
                     daily_tickets.append({"balls": combo, "special": None})
         else:
-            # Fallback: top-N with slight shuffle for variety
-            sorted_nums = sorted(WHITE_RANGE, key=lambda n: final_w.get(n, 0), reverse=True)
-            for i in range(5):
-                pool = sorted_nums[:max(WHITE_COUNT + i * 2, WHITE_COUNT)]
-                combo = sorted(random.choices(pool, k=WHITE_COUNT))
+            # Fallback (no numpy): use overall final_w, sample each position
+            digits = list(WHITE_RANGE)
+            wts = [final_w.get(n, 1.0) for n in digits]
+            daily_tickets = []
+            used_daily = []
+            for _ in range(5):
+                combo = [random.choices(digits, weights=wts, k=1)[0]
+                         for _ in range(WHITE_COUNT)]
+                if combo not in used_daily:
+                    used_daily.append(combo)
                 daily_tickets.append({"balls": combo, "special": None})
         return daily_tickets
 
