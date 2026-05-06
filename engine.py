@@ -28,6 +28,11 @@ try:
     import requests
     from bs4 import BeautifulSoup;  HAS_REQUESTS = True
 except ImportError:                 HAS_REQUESTS = False
+try:
+    from ca_daily_scraper import scrape_daily as _scrape_ca_daily
+    HAS_CA_DAILY = True
+except ImportError:
+    HAS_CA_DAILY = False
 
 # ── Data directory ─────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("NUMERO_DATA_DIR", "/opt/render/project/src/data"))
@@ -151,8 +156,18 @@ def load_draws(game: dict) -> list:
             try:
                 n     = game["white_count"]
                 balls   = [int(r[f"ball_{i}"]) for i in range(1, n + 1)]
-                special = int(r["special"])
-                rows.append({"date": r["date"].strip(), "balls": balls, "special": special})
+                # Handle games with no special ball (Daily 3/4)
+                if game.get("special_name") and game["special_name"] and r.get("special", ""):
+                    special = int(r["special"])
+                elif game.get("special_max", 0) == 0:
+                    special = None
+                else:
+                    special = int(r["special"])
+                row = {"date": r["date"].strip(), "balls": balls, "special": special}
+                # Preserve draw_type if present (Daily 3 midday/evening)
+                if "draw_type" in r and r["draw_type"]:
+                    row["draw_type"] = r["draw_type"]
+                rows.append(row)
             except Exception:
                 pass
     return rows
@@ -164,13 +179,18 @@ def save_draws(game: dict, rows: list):
         path.with_suffix(".bak.csv").write_bytes(path.read_bytes())
     n          = game["white_count"]
     fieldnames = ["date"] + [f"ball_{i}" for i in range(1, n + 1)] + ["special"]
+    # Add draw_type column for Daily 3 (twice-daily draws)
+    if game.get("key") == "daily3":
+        fieldnames.append("draw_type")
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in rows:
-            row = {"date": r["date"], "special": r["special"]}
+            row = {"date": r["date"], "special": r.get("special", "")}
             for i, b in enumerate(r["balls"], 1):
                 row[f"ball_{i}"] = b
+            if game.get("key") == "daily3":
+                row["draw_type"] = r.get("draw_type", "")
             writer.writerow(row)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -337,6 +357,11 @@ def _parse_lottery_net_page(html: str, white_max: int, special_max: int,
 def scrape_game(game: dict, existing_rows: list, log_fn=None) -> tuple:
     if not HAS_REQUESTS:
         return 0, "requests/beautifulsoup4 not installed."
+
+    # CA Daily 3 / Daily 4: use dedicated scraper
+    # (lottery.net blocks cloud server IPs; m.lottostrategies.com works)
+    if game.get("key") in ("daily3", "daily4") and HAS_CA_DAILY:
+        return _scrape_ca_daily(game, existing_rows, log_fn=log_fn)
 
     def log(m):
         if log_fn: log_fn(m)
