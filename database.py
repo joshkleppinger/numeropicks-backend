@@ -234,5 +234,7 @@ def load_draws_db(game: str) -> list:
             result.append(row)
         return result
     except Exception as e:
+        import traceback
         print(f"[db] load_draws error: {e}")
+        traceback.print_exc()
         return []
