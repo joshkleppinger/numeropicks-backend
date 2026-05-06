@@ -181,20 +181,21 @@ def save_draws_db(game: str, rows: list) -> int:
     try:
         with conn.cursor() as cur:
             for r in rows:
+                special = int(r["special"]) if r.get("special") is not None else None
+                draw_type = r.get("draw_type") or ''
                 try:
-                    special = int(r["special"]) if r.get("special") is not None else None
-                    # Use empty string instead of NULL for draw_type so unique index works
-                    draw_type = r.get("draw_type") or ''
                     cur.execute("""
                         INSERT INTO draw_history (game, draw_date, balls, special, draw_type)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (game, draw_date, draw_type) DO NOTHING
+                        SELECT %s, %s, %s, %s, %s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM draw_history
+                            WHERE game=%s AND draw_date=%s AND draw_type=%s
+                        )
                     """, (
-                        game,
-                        r["date"],
+                        game, r["date"],
                         json.dumps([int(b) for b in r["balls"]]),
-                        special,
-                        draw_type,
+                        special, draw_type,
+                        game, r["date"], draw_type,
                     ))
                     if cur.rowcount > 0:
                         added += 1
