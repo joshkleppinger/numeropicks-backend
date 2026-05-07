@@ -1322,9 +1322,23 @@ def save_predictions(game: dict, tickets: list, target_date_str: str):
 
 
 def compute_accuracy(pred_balls, pred_special, actual_balls, actual_special) -> float:
-    hits   = len(set(pred_balls) & set(actual_balls))
-    sp_hit = (pred_special == actual_special)
-    n      = len(pred_balls)
+    # For games WITH a special ball: count distinct hits via set intersection.
+    # For games WITHOUT (Daily 3/4, both specials None): count BOX hits (multiset
+    # intersection — preserves repeated digits) and treat sp_hit as N/A.
+    has_special = (pred_special is not None) or (actual_special is not None)
+
+    if has_special:
+        hits   = len(set(pred_balls) & set(actual_balls))
+        sp_hit = (pred_special == actual_special)
+    else:
+        # Multiset intersection: handles repeated digits like 3-3-5 vs 3-3-5 = 3 hits
+        from collections import Counter
+        pc = Counter(pred_balls)
+        ac = Counter(actual_balls)
+        hits = sum((pc & ac).values())
+        sp_hit = False  # no special ball in this game; never credit it
+
+    n = len(pred_balls)
     if hits == n and sp_hit:   return 1.00
     if hits == n:              return 0.99
     if hits == n-1 and sp_hit: return 0.83
@@ -1347,7 +1361,14 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
     draw_by_date = {}
     for r in draw_rows:
         dt = parse_date(r["date"])
-        if dt: draw_by_date[dt.date()] = r
+        if not dt:
+            continue
+        # Prefer Evening for Daily 3 (two draws/date); no-op for other games.
+        existing = draw_by_date.get(dt.date())
+        if existing is None:
+            draw_by_date[dt.date()] = r
+        elif r.get("draw_type") == "Evening" and existing.get("draw_type") != "Evening":
+            draw_by_date[dt.date()] = r
     today  = datetime.now().date()
     rounds = defaultdict(list)
     try:
@@ -1381,6 +1402,13 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
             t["pred_balls"], t["pred_special"], actual["balls"], actual["special"]))
         score = compute_accuracy(best["pred_balls"], best["pred_special"],
                                  actual["balls"], actual["special"])
+        if best["pred_special"] is None and actual["special"] is None:
+            from collections import Counter
+            white_matches = sum((Counter(best["pred_balls"]) & Counter(actual["balls"])).values())
+            sp_match = 0
+        else:
+            white_matches = len(set(best["pred_balls"]) & set(actual["balls"]))
+            sp_match = int(best["pred_special"] == actual["special"])
         evaluated.append({
             "prediction_date":  pred_date,
             "target_draw_date": target_date,
@@ -1388,8 +1416,8 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
             "pred_special":     best["pred_special"],
             "actual_balls":     actual["balls"],
             "actual_special":   actual["special"],
-            "white_matches":    len(set(best["pred_balls"]) & set(actual["balls"])),
-            "sp_match":         int(best["pred_special"] == actual["special"]),
+            "white_matches":    white_matches,
+            "sp_match":         sp_match,
             "score":            score,
         })
     evaluated.sort(key=lambda r: parse_date(r["target_draw_date"]) or datetime.min)
@@ -1403,7 +1431,19 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
     draw_by_date = {}
     for r in draw_rows:
         dt = parse_date(r["date"])
-        if dt: draw_by_date[dt.date()] = r
+        if not dt:
+            continue
+        # Daily 3 has two draws per date (Midday + Evening). The engine targets
+        # the NEXT legal draw, which for Daily 3 is most often Evening. Prefer
+        # Evening rows for accuracy lookup so predictions are scored against
+        # the right session. For other games this branch is a no-op.
+        existing = draw_by_date.get(dt.date())
+        if existing is None:
+            draw_by_date[dt.date()] = r
+        else:
+            # Replace only if the new row is Evening and the existing one isn't
+            if r.get("draw_type") == "Evening" and existing.get("draw_type") != "Evening":
+                draw_by_date[dt.date()] = r
 
     from datetime import datetime as _dt
     today = _dt.now().date()
@@ -1439,6 +1479,15 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
             actual["balls"], actual["special"]))
         score = compute_accuracy(best["pred_balls"], best["pred_special"],
                                   actual["balls"], actual["special"])
+        # For Daily 3/4 the special is None on both sides — count multiset hits
+        # so 3-3-5 vs 3-3-5 yields 3, not 2 (which set() would give).
+        if best["pred_special"] is None and actual["special"] is None:
+            from collections import Counter
+            white_matches = sum((Counter(best["pred_balls"]) & Counter(actual["balls"])).values())
+            sp_match = 0  # game has no special ball
+        else:
+            white_matches = len(set(best["pred_balls"]) & set(actual["balls"]))
+            sp_match = int(best["pred_special"] == actual["special"])
         evaluated.append({
             "prediction_date":  pred_date,
             "target_draw_date": target_date,
@@ -1446,8 +1495,8 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
             "pred_special":     best["pred_special"],
             "actual_balls":     actual["balls"],
             "actual_special":   actual["special"],
-            "white_matches":    len(set(best["pred_balls"]) & set(actual["balls"])),
-            "sp_match":         int(best["pred_special"] == actual["special"]),
+            "white_matches":    white_matches,
+            "sp_match":         sp_match,
             "score":            score,
         })
 
