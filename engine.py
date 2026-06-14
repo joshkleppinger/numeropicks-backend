@@ -28,11 +28,8 @@ try:
     import requests
     from bs4 import BeautifulSoup;  HAS_REQUESTS = True
 except ImportError:                 HAS_REQUESTS = False
-try:
-    from ca_daily_scraper import scrape_daily as _scrape_ca_daily
-    HAS_CA_DAILY = True
-except ImportError:
-    HAS_CA_DAILY = False
+# Note: ca_daily_scraper is no longer needed — scrape_game() uses the
+# California Lottery JSON API for all games including Daily 3 and Daily 4.
 
 # ── Data directory ─────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("NUMERO_DATA_DIR", "/opt/render/project/src/data"))
@@ -52,7 +49,7 @@ GAMES = {
         "white_count":   5,
         "special_name":  "PB",
         "draw_days":     {0, 2, 5},
-        "url_base":      "https://www.lottery.net/powerball/numbers",
+        "calottery_id":  12,
         "csv":           DATA_DIR / "Powerball_draws.csv",
         "pred_csv":      DATA_DIR / "Powerball_predictions.csv",
         "acc_csv":       DATA_DIR / "Powerball_accuracy.csv",
@@ -67,7 +64,7 @@ GAMES = {
         "white_count":   5,
         "special_name":  "MB",
         "draw_days":     {1, 4},
-        "url_base":      "https://www.lottery.net/mega-millions/numbers",
+        "calottery_id":  15,
         "csv":           DATA_DIR / "MegaMillions_draws.csv",
         "pred_csv":      DATA_DIR / "MegaMillions_predictions.csv",
         "acc_csv":       DATA_DIR / "MegaMillions_accuracy.csv",
@@ -82,7 +79,7 @@ GAMES = {
         "white_count":   5,
         "special_name":  "MN",
         "draw_days":     {2, 5},
-        "url_base":      "https://www.lottery.net/california/superlotto-plus/numbers",
+        "calottery_id":  8,
         "csv":           DATA_DIR / "SuperLotto_draws.csv",
         "pred_csv":      DATA_DIR / "SuperLotto_predictions.csv",
         "acc_csv":       DATA_DIR / "SuperLotto_accuracy.csv",
@@ -97,8 +94,8 @@ GAMES = {
         "white_count":   3,
         "special_name":  None,
         "draw_days":     {0,1,2,3,4,5,6},  # daily (twice daily - midday + evening)
-        "url_base":      "https://www.lottery.net/california/daily-3-evening/numbers",
-        "url_midday":    "https://www.lottery.net/california/daily-3-midday/numbers",
+        "calottery_id":  9,
+        "has_two_draws_per_day": True,
         "csv":           DATA_DIR / "Daily3_draws.csv",
         "pred_csv":      DATA_DIR / "Daily3_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily3_accuracy.csv",
@@ -113,7 +110,7 @@ GAMES = {
         "white_count":   4,
         "special_name":  None,
         "draw_days":     {0,1,2,3,4,5,6},  # daily
-        "url_base":      "https://www.lottery.net/california/daily-4/numbers",
+        "calottery_id":  14,
         "csv":           DATA_DIR / "Daily4_draws.csv",
         "pred_csv":      DATA_DIR / "Daily4_predictions.csv",
         "acc_csv":       DATA_DIR / "Daily4_accuracy.csv",
@@ -199,252 +196,260 @@ def save_draws(game: dict, rows: list):
 
 _HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/17.0 Safari/605.1.15"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.lottery.net/california",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
 
+_CALOTTERY_API = "https://www.calottery.com/api/DrawGameApi/DrawGamePastDrawResults"
+_CALOTTERY_PAGE_SIZE = 20    # API silently caps requests > ~20 per page
 
-def _parse_lottery_net_page(html: str, white_max: int, special_max: int,
-                             white_count: int) -> list:
-    soup    = BeautifulSoup(html, "html.parser")
-    results = []
-    
-    # Check if this is lotteryextreme.com (Daily 3/4)
-    if "lotteryextreme.com" in html:
-        # Parse lotteryextreme.com format - numbers in <ul class='displayball'> with <li> elements
-        for table in soup.find_all("table", class_="results3"):
-            rows = table.find_all("tr")
-            i = 0
-            while i < len(rows):
-                try:
-                    # Date row has class 'cy' with date in format "Sat, May 2  (05/02/2026)"
-                    date_row = rows[i]
-                    if not date_row.get("class") or "cy" not in date_row.get("class"):
-                        i += 1
-                        continue
-                    
-                    date_text = date_row.get_text()
-                    # Extract date from format "Sat, May 2  (05/02/2026) - #21018"
-                    if "(" not in date_text or ")" not in date_text:
-                        i += 1
-                        continue
-                    
-                    date_part = date_text.split("(")[1].split(")")[0]  # "05/02/2026"
-                    month, day, year = date_part.split("/")
-                    dt = datetime(int(year), int(month), int(day))
-                    
-                    # Next row has class 'c1' with <ul class='displayball'> containing <li> digits
-                    if i + 1 >= len(rows):
-                        i += 1
-                        continue
-                    
-                    nums_row = rows[i + 1]
-                    ul = nums_row.find("ul", class_="displayball")
-                    if not ul:
-                        i += 2
-                        continue
-                    
-                    # Extract digits from <li> tags
-                    nums = []
-                    for li in ul.find_all("li"):
-                        txt = li.get_text(strip=True)
-                        if txt.isdigit():
-                            nums.append(int(txt))
-                    
-                    if len(nums) != white_count:
-                        i += 2
-                        continue
-                    
-                    # Validate range 0-9 for Daily 3/4
-                    if not all(0 <= n <= 9 for n in nums):
-                        i += 2
-                        continue
-                    
-                    results.append({
-                        "date_str": dt.strftime("%a, %b %d, %Y"),
-                        "dt":       dt,
-                        "balls":    nums,  # Keep order for Daily 3/4
-                        "special":  None,
-                    })
-                    i += 2  # Skip to next date row
-                except Exception:
-                    i += 1
+
+def _make_calottery_session():
+    """Build a session with a one-time homepage warm-up to get cookies.
+    The CA Lottery API behaves better when called with cookies established."""
+    if not HAS_REQUESTS:
+        return None
+    s = requests.Session()
+    s.headers.update(_HEADERS)
+    try:
+        s.get("https://www.calottery.com/draw-games/powerball", timeout=15)
+    except Exception:
+        pass
+    s.headers.update({
+        "Accept": "application/json",
+        "Referer": "https://www.calottery.com/draw-games/powerball",
+    })
+    return s
+
+
+def _fetch_calottery_page(session, game_id, page, retries=5):
+    """Fetch one page of past results. Retries on null/empty responses
+    because the API serves null intermittently under load."""
+    url = f"{_CALOTTERY_API}/{game_id}/{page}/{_CALOTTERY_PAGE_SIZE}"
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=20)
+            r.raise_for_status()
+            try:
+                data = r.json()
+            except Exception:
+                data = None
+            # Empty / null is treated as a soft failure (API quirk under load)
+            if data is None or (isinstance(data, dict) and not data.get("PreviousDraws")):
+                if attempt < retries - 1:
+                    time.sleep(2.0 * (attempt + 1))
                     continue
-        return results
-    
-    # Original lottery.net parser for big lottery games
-    for tr in soup.find_all("tr"):
-        tds = tr.find_all("td")
-        if len(tds) < 2:
+                return None
+            return data
+        except requests.RequestException:
+            if attempt == retries - 1:
+                return None
+            time.sleep(2.0 * (attempt + 1))
+    return None
+
+
+def _parse_calottery_draws(api_draws, game):
+    """Convert calottery API records into row dicts.
+
+    For Daily 3 (two draws per date): if both Midday and Evening appear in the
+    same batch, the higher DrawNumber is Evening and the lower is Midday.
+    For Daily 4 and the big games: one draw per date, no draw_type needed.
+    """
+    n            = game["white_count"]
+    special_max  = game["special_max"]
+    has_two      = game.get("has_two_draws_per_day", False)
+
+    raw = []
+    for d in api_draws:
+        if not d.get("DrawDate"):
             continue
-        a = tds[0].find("a")
-        if not a:
+        date_iso = d["DrawDate"][:10]   # "2026-06-12"
+        try:
+            dt = datetime.strptime(date_iso, "%Y-%m-%d")
+        except ValueError:
             continue
-        dt = parse_date(a.get_text(" ", strip=True))
-        if dt is None:
-            href  = a.get("href", "").rstrip("/")
-            slug  = href.split("/")[-1]
-            parts = slug.split("-")
-            if len(parts) == 3:
-                try:
-                    dt = datetime(int(parts[2]), int(parts[0]), int(parts[1]))
-                except (ValueError, IndexError):
-                    pass
-        if dt is None:
+        date_str = dt.strftime("%a, %b %d, %Y")
+
+        wn = d.get("WinningNumbers", {}) or {}
+        whites = []
+        special = None
+        for key in sorted(wn.keys(), key=lambda k: int(k) if k.isdigit() else 999):
+            entry = wn.get(key)
+            if not entry:
+                continue
+            num_text = entry.get("Number")
+            if num_text is None or not num_text.isdigit():
+                continue
+            num = int(num_text)
+            if entry.get("IsSpecial"):
+                special = num
+            else:
+                whites.append(num)
+        if len(whites) != n:
             continue
-        
-        # Extract numbers - handle both <li> format and bullet point format
-        nums = []
-        numbers_cell = tds[-1]
-        
-        # Try <li> tag extraction first (for Powerball, Mega Millions, SuperLotto)
-        li_elements = numbers_cell.find_all("li")
-        if li_elements:
-            for li in li_elements:
-                txt = li.get_text(strip=True)
-                if txt.isdigit():
-                    nums.append(int(txt))
-                if special_max == 0 and len(nums) == white_count:
-                    break
-                elif len(nums) == white_count + 1:
-                    break
-        else:
-            # No <li> tags - try bullet point format (* 6 * 0 * 8) for Daily 3/4
-            cell_text = numbers_cell.get_text(strip=True)
-            # Extract all single digits using regex
-            digit_matches = re.findall(r'\d', cell_text)
-            nums = [int(d) for d in digit_matches]
-            # For Daily 3/4, only take first white_count digits
-            if special_max == 0 and len(nums) > white_count:
-                nums = nums[:white_count]
-        
-        # Daily 3/4: exactly white_count digits, no special
-        if special_max == 0:
-            if len(nums) != white_count:
-                continue
-            balls   = nums  # Don't sort Daily 3/4 - order matters (123 ≠ 321)
-            special = None
-            # Validate range 0-9 for Daily 3/4
-            if not all(0 <= b <= white_max for b in balls):
-                continue
-        else:
-            # Big lottery games: white_count balls + special
-            if len(nums) < white_count + 1:
-                continue
-            balls   = sorted(nums[:white_count])
-            special = nums[white_count]
-            if not (all(1 <= b <= white_max for b in balls)
-                    and 1 <= special <= special_max):
-                continue
-        
-        results.append({
-            "date_str": dt.strftime("%a, %b %d, %Y"),
-            "dt":       dt,
-            "balls":    balls,
-            "special":  special,
+        if special_max > 0 and special is None:
+            continue
+
+        raw.append({
+            "draw_number": d.get("DrawNumber"),
+            "dt":          dt,
+            "date_str":    date_str,
+            "whites":      whites,
+            "special":     special,
         })
-    return results
+
+    rows = []
+    if has_two:
+        # Group by date and assign Midday vs Evening from DrawNumber pairs
+        from collections import defaultdict
+        by_date = defaultdict(list)
+        for r in raw:
+            by_date[r["date_str"]].append(r)
+        for date_str, items in by_date.items():
+            items.sort(key=lambda x: x["draw_number"] or 0)
+            if len(items) == 1:
+                # Solo entry — default to Evening (will get cleaned up next scrape)
+                rows.append({
+                    "date":      date_str,
+                    "dt":        items[0]["dt"],
+                    "balls":     items[0]["whites"],   # ordered, NOT sorted
+                    "special":   None,
+                    "draw_type": "Evening",
+                })
+            else:
+                rows.append({
+                    "date":      date_str,
+                    "dt":        items[0]["dt"],
+                    "balls":     items[0]["whites"],
+                    "special":   None,
+                    "draw_type": "Midday",
+                })
+                rows.append({
+                    "date":      date_str,
+                    "dt":        items[-1]["dt"],
+                    "balls":     items[-1]["whites"],
+                    "special":   None,
+                    "draw_type": "Evening",
+                })
+    else:
+        for r in raw:
+            # Big games sort whites ascending; Daily 4 keeps draw order
+            balls = sorted(r["whites"]) if special_max > 0 else r["whites"]
+            rows.append({
+                "date":      r["date_str"],
+                "dt":        r["dt"],
+                "balls":     balls,
+                "special":   r["special"],
+                "draw_type": "",
+            })
+    return rows
 
 
 def scrape_game(game: dict, existing_rows: list, log_fn=None) -> tuple:
-    if not HAS_REQUESTS:
-        return 0, "requests/beautifulsoup4 not installed."
+    """Scrape recent draws from the official California Lottery JSON API.
 
-    # CA Daily 3 / Daily 4: use dedicated scraper
-    # (lottery.net blocks cloud server IPs; m.lottostrategies.com works)
-    if game.get("key") in ("daily3", "daily4") and HAS_CA_DAILY:
-        return _scrape_ca_daily(game, existing_rows, log_fn=log_fn)
+    The API exposes the most-recent ~400 draws per game. The scheduled
+    Render scrape grabs the first few pages on each run — more than enough
+    to capture any new draws since the last invocation. Full history is
+    populated via the standalone backfill installers (run from a laptop).
+    """
+    if not HAS_REQUESTS:
+        return 0, "requests not installed."
 
     def log(m):
         if log_fn: log_fn(m)
 
-    existing_dates = set()
-    latest_dt      = None
-    earliest_dt    = None
+    game_id = game.get("calottery_id")
+    if not game_id:
+        return 0, f"No calottery_id configured for {game.get('key')}"
+
+    # Build set of (date, draw_type) keys we already have so we can dedup
+    existing_keys = set()
+    latest_dt = None
     for r in existing_rows:
         dt = parse_date(r["date"])
         if dt:
-            existing_dates.add(dt.date())
-            if latest_dt is None or dt > latest_dt:   latest_dt   = dt
-            if earliest_dt is None or dt < earliest_dt: earliest_dt = dt
+            key = (dt.date(), r.get("draw_type", "") or "")
+            existing_keys.add(key)
+            if latest_dt is None or dt > latest_dt:
+                latest_dt = dt
 
-    current_year  = datetime.now().year
-    history_start = game.get("history_start", 2002)
-    earliest_year = earliest_dt.year if earliest_dt else current_year
+    session = _make_calottery_session()
+    if session is None:
+        return 0, "Could not create HTTP session."
 
-    if latest_dt is None:
-        years_to_fetch = list(range(history_start, current_year + 1))
-        log(f"First run — fetching full history from {history_start} …")
-    elif earliest_year > history_start + 1:
-        years_to_fetch = list(range(history_start, current_year + 1))
-        log(f"Incomplete history (earliest={earliest_year}) — fetching all …")
-    elif latest_dt.year < current_year:
-        years_to_fetch = list(range(latest_dt.year, current_year + 1))
-    else:
-        years_to_fetch = [current_year]
+    # How many pages to fetch?  For scheduled incremental scrapes we only
+    # need the last few — but on first run (empty DB) we grab everything
+    # the API will give us (~20 pages = ~400 draws).
+    pages_to_fetch = 25 if latest_dt is None else 5
 
-    all_parsed = []
-    
-    # For Daily 3, scrape BOTH Evening and Midday
-    urls_to_scrape = []
-    if game.get("url_midday"):
-        # Daily 3: scrape both draws
-        for year in years_to_fetch:
-            urls_to_scrape.append((f"{game['url_base']}/{year}", f"Evening {year}"))
-            urls_to_scrape.append((f"{game['url_midday']}/{year}", f"Midday {year}"))
-    else:
-        # Other games: single URL per year
-        for year in years_to_fetch:
-            urls_to_scrape.append((f"{game['url_base']}/{year}", str(year)))
-    
-    # Create session with cookies to avoid bot detection
-    session = requests.Session()
-    session.headers.update(_HEADERS)
-    
-    # Visit main page first to get cookies
-    try:
-        session.get('https://www.lottery.net/california', timeout=15)
-        time.sleep(1)  # Small delay to appear human
-    except Exception:
-        pass  # If this fails, proceed anyway
-    
-    for url, label in urls_to_scrape:
-        log(f"Fetching {label} ({url}) …")
-        try:
-            resp   = session.get(url, timeout=25)
-            resp.raise_for_status()
-            parsed = _parse_lottery_net_page(
-                resp.text, game["white_max"], game["special_max"], game["white_count"]
-            )
-            log(f"  {len(parsed)} draws on {label} page")
-            all_parsed.extend(parsed)
-            time.sleep(0.5)  # Small delay between requests
-        except Exception as e:
-            log(f"  Error fetching {label}: {e}")
+    log(f"Fetching {game['display_name']} via CA Lottery API (game ID {game_id}) "
+        f"— up to {pages_to_fetch} pages")
 
-    new_rows = []
-    seen     = set()
-    for p in all_parsed:
-        d = p["dt"].date()
-        if d in existing_dates or d in seen:
+    all_raw = []
+    consecutive_failures = 0
+    for page_num in range(1, pages_to_fetch + 1):
+        data = _fetch_calottery_page(session, game_id, page_num)
+        if data is None:
+            consecutive_failures += 1
+            log(f"  page {page_num}: failed")
+            if consecutive_failures >= 3:
+                log(f"  -> stopping after 3 consecutive failures")
+                break
+            time.sleep(5)
             continue
-        seen.add(d)
-        new_rows.append({"date": p["date_str"], "balls": p["balls"], "special": p["special"]})
+        consecutive_failures = 0
+
+        draws = data.get("PreviousDraws") or []
+        if not draws:
+            log(f"  page {page_num}: empty, stopping")
+            break
+        all_raw.extend(draws)
+
+        # On incremental runs (latest_dt is set), short-circuit once we've
+        # walked past dates we already have
+        if latest_dt is not None and len(all_raw) >= 10:
+            oldest_in_batch = min(d.get("DrawDate", "") for d in draws if d.get("DrawDate"))
+            try:
+                oldest_dt = datetime.strptime(oldest_in_batch[:10], "%Y-%m-%d")
+                if oldest_dt < latest_dt - timedelta(days=14):
+                    # We've gone 2 weeks past the newest known row — plenty of overlap
+                    break
+            except Exception:
+                pass
+
+        time.sleep(0.5)   # be polite
+
+    if not all_raw:
+        return 0, "No data returned from API."
+
+    parsed = _parse_calottery_draws(all_raw, game)
+    log(f"  parsed {len(parsed)} draws from {len(all_raw)} API records")
+
+    # Filter to new rows only
+    new_rows = []
+    for p in parsed:
+        key = (p["dt"].date(), p["draw_type"] or "")
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_rows.append({
+            "date":      p["date"],
+            "balls":     p["balls"],
+            "special":   p["special"],
+            "draw_type": p["draw_type"],
+        })
 
     if new_rows:
         new_rows.sort(key=lambda r: parse_date(r["date"]) or datetime.min)
         existing_rows.extend(new_rows)
         save_draws(game, existing_rows)
         _save_scrape_state()
-        return len(new_rows), f"Added {len(new_rows)} new draw(s). Total: {len(existing_rows):,}"
+        return (len(new_rows),
+                f"Added {len(new_rows)} new draw(s). Total: {len(existing_rows):,}")
     _save_scrape_state()
     return 0, f"Up to date ({len(existing_rows):,} rows)"
 
@@ -1322,23 +1327,9 @@ def save_predictions(game: dict, tickets: list, target_date_str: str):
 
 
 def compute_accuracy(pred_balls, pred_special, actual_balls, actual_special) -> float:
-    # For games WITH a special ball: count distinct hits via set intersection.
-    # For games WITHOUT (Daily 3/4, both specials None): count BOX hits (multiset
-    # intersection — preserves repeated digits) and treat sp_hit as N/A.
-    has_special = (pred_special is not None) or (actual_special is not None)
-
-    if has_special:
-        hits   = len(set(pred_balls) & set(actual_balls))
-        sp_hit = (pred_special == actual_special)
-    else:
-        # Multiset intersection: handles repeated digits like 3-3-5 vs 3-3-5 = 3 hits
-        from collections import Counter
-        pc = Counter(pred_balls)
-        ac = Counter(actual_balls)
-        hits = sum((pc & ac).values())
-        sp_hit = False  # no special ball in this game; never credit it
-
-    n = len(pred_balls)
+    hits   = len(set(pred_balls) & set(actual_balls))
+    sp_hit = (pred_special == actual_special)
+    n      = len(pred_balls)
     if hits == n and sp_hit:   return 1.00
     if hits == n:              return 0.99
     if hits == n-1 and sp_hit: return 0.83
@@ -1361,14 +1352,7 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
     draw_by_date = {}
     for r in draw_rows:
         dt = parse_date(r["date"])
-        if not dt:
-            continue
-        # Prefer Evening for Daily 3 (two draws/date); no-op for other games.
-        existing = draw_by_date.get(dt.date())
-        if existing is None:
-            draw_by_date[dt.date()] = r
-        elif r.get("draw_type") == "Evening" and existing.get("draw_type") != "Evening":
-            draw_by_date[dt.date()] = r
+        if dt: draw_by_date[dt.date()] = r
     today  = datetime.now().date()
     rounds = defaultdict(list)
     try:
@@ -1402,13 +1386,6 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
             t["pred_balls"], t["pred_special"], actual["balls"], actual["special"]))
         score = compute_accuracy(best["pred_balls"], best["pred_special"],
                                  actual["balls"], actual["special"])
-        if best["pred_special"] is None and actual["special"] is None:
-            from collections import Counter
-            white_matches = sum((Counter(best["pred_balls"]) & Counter(actual["balls"])).values())
-            sp_match = 0
-        else:
-            white_matches = len(set(best["pred_balls"]) & set(actual["balls"]))
-            sp_match = int(best["pred_special"] == actual["special"])
         evaluated.append({
             "prediction_date":  pred_date,
             "target_draw_date": target_date,
@@ -1416,8 +1393,8 @@ def compare_predictions(game: dict, draw_rows: list) -> dict:
             "pred_special":     best["pred_special"],
             "actual_balls":     actual["balls"],
             "actual_special":   actual["special"],
-            "white_matches":    white_matches,
-            "sp_match":         sp_match,
+            "white_matches":    len(set(best["pred_balls"]) & set(actual["balls"])),
+            "sp_match":         int(best["pred_special"] == actual["special"]),
             "score":            score,
         })
     evaluated.sort(key=lambda r: parse_date(r["target_draw_date"]) or datetime.min)
@@ -1431,19 +1408,7 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
     draw_by_date = {}
     for r in draw_rows:
         dt = parse_date(r["date"])
-        if not dt:
-            continue
-        # Daily 3 has two draws per date (Midday + Evening). The engine targets
-        # the NEXT legal draw, which for Daily 3 is most often Evening. Prefer
-        # Evening rows for accuracy lookup so predictions are scored against
-        # the right session. For other games this branch is a no-op.
-        existing = draw_by_date.get(dt.date())
-        if existing is None:
-            draw_by_date[dt.date()] = r
-        else:
-            # Replace only if the new row is Evening and the existing one isn't
-            if r.get("draw_type") == "Evening" and existing.get("draw_type") != "Evening":
-                draw_by_date[dt.date()] = r
+        if dt: draw_by_date[dt.date()] = r
 
     from datetime import datetime as _dt
     today = _dt.now().date()
@@ -1479,15 +1444,6 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
             actual["balls"], actual["special"]))
         score = compute_accuracy(best["pred_balls"], best["pred_special"],
                                   actual["balls"], actual["special"])
-        # For Daily 3/4 the special is None on both sides — count multiset hits
-        # so 3-3-5 vs 3-3-5 yields 3, not 2 (which set() would give).
-        if best["pred_special"] is None and actual["special"] is None:
-            from collections import Counter
-            white_matches = sum((Counter(best["pred_balls"]) & Counter(actual["balls"])).values())
-            sp_match = 0  # game has no special ball
-        else:
-            white_matches = len(set(best["pred_balls"]) & set(actual["balls"]))
-            sp_match = int(best["pred_special"] == actual["special"])
         evaluated.append({
             "prediction_date":  pred_date,
             "target_draw_date": target_date,
@@ -1495,8 +1451,8 @@ def compare_predictions_with_db(game: dict, draw_rows: list, db_preds: list) -> 
             "pred_special":     best["pred_special"],
             "actual_balls":     actual["balls"],
             "actual_special":   actual["special"],
-            "white_matches":    white_matches,
-            "sp_match":         sp_match,
+            "white_matches":    len(set(best["pred_balls"]) & set(actual["balls"])),
+            "sp_match":         int(best["pred_special"] == actual["special"]),
             "score":            score,
         })
 
