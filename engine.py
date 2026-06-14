@@ -849,6 +849,14 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
     if not rows:
         return []
 
+    # ── Ensure chronological order ────────────────────────────────────────
+    # Many downstream methods (gap analysis, Markov, decay weighting, the
+    # neural-network sequence model, and the era filter below) all assume
+    # rows are ordered oldest → newest. The DB may return rows in insert
+    # order, which is NOT chronological when backfills were applied piece-
+    # meal. We sort defensively here.
+    rows = sorted(rows, key=lambda r: parse_date(r.get("date", "")) or datetime.min)
+
     WHITE_MAX   = game["white_max"]
     SPECIAL_MAX = game["special_max"]
     WHITE_COUNT = game["white_count"]
