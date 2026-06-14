@@ -84,7 +84,8 @@ GAMES = {
         "pred_csv":      DATA_DIR / "SuperLotto_predictions.csv",
         "acc_csv":       DATA_DIR / "SuperLotto_accuracy.csv",
         "history_start": 1986,
-        "era_changes":   [47],
+        "era_changes":   [49, 47],   # 1986-2000: 1-49 (original SuperLotto)
+                                     # 2000+: 1-47 (SuperLotto Plus, current)
     },
     "daily3": {
         "key":           "daily3",
@@ -864,11 +865,61 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
         all_balls   = [r["balls"]   for r in rows]
         all_special = [r["special"] for r in rows]
 
+    # ── Filter to current-era draws only ──────────────────────────────────
+    # Each game went through ball-pool changes over the years. Training on
+    # all eras together biases predictions:
+    #   - Numbers added in recent eras look "cold" because they had fewer
+    #     opportunities to be drawn (Powerball 60-69, only since 2015)
+    #   - Numbers removed from the current era distort frequencies if they
+    #     still appear in old training rows (old SuperLotto 48-49)
+    #
+    # era_changes is the list of historical white-ball caps, oldest first,
+    # current era LAST. Examples:
+    #   Powerball:  [49, 59, 69]   range grew over time
+    #   Mega Mil.:  [56, 75, 70]   range grew then shrank (was 75, now 70)
+    #   SuperLotto: [49, 47]       range shrank from 49 to 47
+    #   Daily 3/4:  [9]            single era, no filter
+    #
+    # We combine two filters:
+    #   (a) GROWING-range filter (forward): find the first draw containing
+    #       a ball higher than max(previous caps). Earlier draws may have
+    #       come from a smaller-range era and are excluded.
+    #   (b) SHRINKING-range filter (backward): find the last draw with
+    #       a ball higher than current_cap. Such a draw is from an older,
+    #       larger-range era; start the current era right after it.
+    # ERA3_START is the LATER (larger) of the two — making sure we satisfy
+    # both conditions.
     ERA3_START = 0
     era_changes = game.get("era_changes", [WHITE_MAX])
-    for i, r in enumerate(rows):
-        if any(b > era_changes[0] for b in r["balls"]) and ERA3_START == 0:
-            ERA3_START = i
+    if len(era_changes) >= 2 and rows:
+        current_cap = era_changes[-1]
+        max_previous = max(era_changes[:-1])
+
+        # (a) Growing-range filter: only applies if current cap is larger
+        # than some prior cap
+        growing_start = 0
+        if current_cap > max_previous:
+            for i, r in enumerate(rows):
+                if any(b > max_previous for b in r["balls"]):
+                    growing_start = i
+                    break
+
+        # (b) Shrinking-range filter: only applies if some prior cap was
+        # larger than the current cap
+        shrinking_start = 0
+        if max_previous > current_cap:
+            for i in range(len(rows) - 1, -1, -1):
+                if any(b > current_cap for b in rows[i]["balls"]):
+                    shrinking_start = i + 1
+                    break
+
+        # Use the later of the two starts
+        ERA3_START = max(growing_start, shrinking_start)
+
+        # Safety: if the filter eliminated nearly all data, fall back to
+        # using everything (probably an era_changes config issue)
+        if ERA3_START >= len(rows) - 20:
+            ERA3_START = 0
     era3_rows = rows[ERA3_START:]
 
     if HAS_NP:
