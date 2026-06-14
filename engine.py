@@ -903,16 +903,25 @@ def analyze_and_predict(rows: list, game: dict, progress_cb=None) -> list:
         current_cap = era_changes[-1]
         max_previous = max(era_changes[:-1])
 
-        # (a) Growing-range filter: only applies if current cap is larger
-        # than some prior cap
-        growing_start = 0
+        # Choose the growing-range threshold:
+        # - Simple case (range grew monotonically): use max_previous
+        # - Non-monotonic case (range grew then shrank, like Mega Millions
+        #   56→75→70): max_previous (75) is unreachable now, so use the
+        #   highest previous cap that's BELOW the current cap.
         if current_cap > max_previous:
+            growing_threshold = max_previous
+        else:
+            below_current = [c for c in era_changes[:-1] if c < current_cap]
+            growing_threshold = max(below_current) if below_current else None
+
+        growing_start = 0
+        if growing_threshold is not None:
             for i, r in enumerate(rows):
-                if any(b > max_previous for b in r["balls"]):
+                if any(b > growing_threshold for b in r["balls"]):
                     growing_start = i
                     break
 
-        # (b) Shrinking-range filter: only applies if some prior cap was
+        # Shrinking-range filter: only applies if some prior cap was
         # larger than the current cap
         shrinking_start = 0
         if max_previous > current_cap:
